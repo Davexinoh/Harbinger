@@ -8,7 +8,7 @@ import {
   getPnL,
 } from "../db/database.js";
 import { encrypt, decrypt } from "../utils/encryption.js";
-import { validateKeys, getEvents, readRequest } from "../bayse/client.js";
+import { validateKeys, getEvents } from "../bayse/client.js";
 import { runAllSignals } from "../engine/scorer.js";
 import { getEngineStatus } from "../engine/engineLoop.js";
 
@@ -17,7 +17,6 @@ const SETUP_STEPS = {
   AWAITING_SEC_KEY: "awaiting_sec_key",
   AWAITING_THRESHOLD: "awaiting_threshold",
   AWAITING_MAX_AMOUNT: "awaiting_max_amount",
-  AWAITING_CURRENCY: "awaiting_currency",
   AWAITING_LIMIT_UPDATE: "awaiting_limit_update",
   AWAITING_THRESHOLD_UPDATE: "awaiting_threshold_update",
 };
@@ -50,28 +49,29 @@ export function registerCommands(bot) {
 
     const hasKeys = user?.bayse_pub_key && user?.bayse_sec_key;
 
-
     return bot.sendMessage(
       chatId,
-      `🔮 *Harbinger*\n` +
-      `_The market moves. We saw it coming._\n\n` +
-      `Three signals. One engine. Fully autonomous.\n\n` +
-      `Harbinger watches crypto momentum, football form, and live news — then trades Bayse prediction markets the moment signals converge. No charts. No clicking. Just results.\n\n` +
+      `⚡ *Welcome to Harbinger*\n\n` +
+      `I watch crypto prices, football form, and live news — then trade prediction markets on Bayse automatically when signals align.\n\n` +
+      `*How it works:*\n` +
+      `1. You connect your Bayse API keys\n` +
+      `2. Set your confidence threshold and max trade size\n` +
+      `3. Type /run — the engine takes over\n` +
+      `4. I message you every time I fire a trade\n\n` +
       (hasKeys
-        ? `Keys connected. Pick up where you left off:\n` +
-          `/run — fire the engine\n` +
-          `/signals — live signal scores right now\n` +
-          `/trades — your trade history\n\n`
-        : `Get started:\n` +
-          `/connect — link your Bayse account\n` +
-          `/setup — set threshold and trade size\n` +
-          `/run — engine takes over\n\n`) +
-      `/trade — place a manual trade\n` +
-      `/markets — browse open markets\n` +
-      `/hot — markets with active signals\n` +
-      `/pnl — your P\\&L\n` +
-      `/crowdiq — crowd wisdom accuracy\n` +
-      `/status — engine state`,
+        ? `✅ Keys connected. Type /run to start.\n\n`
+        : `Type /connect to link your Bayse account.\n\n`) +
+      `*Commands*\n` +
+      `/connect — link Bayse API keys\n` +
+      `/setup — configure thresholds\n` +
+      `/run — start engine\n` +
+      `/status — current signal state\n` +
+      `/signals — live signal scores\n` +
+      `/trades — recent trade history\n` +
+      `/pnl — your P\\&L summary\n` +
+      `/markets — open Bayse markets\n` +
+      `/pause — pause engine\n` +
+      `/disconnect — remove your keys`,
       { parse_mode: "Markdown" }
     );
   });
@@ -303,10 +303,8 @@ export function registerCommands(bot) {
     });
 
     try {
-      const user = getUser(chatId);
-      const pubKey = decrypt(user?.bayse_pub_key);
-      if (!pubKey) return bot.sendMessage(chatId, `❌ Connect your Bayse keys first with /connect`);
-      const events = await getEvents(pubKey, { status: "open", size: 10 });
+      const data = await getEvents(null, "open", 10);
+      const events = data?.data || [];
 
       if (!events.length) {
         return bot.sendMessage(chatId, `📭 No open markets found right now.`);
@@ -338,8 +336,7 @@ export function registerCommands(bot) {
     try {
       const { findMatchingMarket, runAllSignals } = await import("../engine/scorer.js");
       const signals = await runAllSignals();
-      const _pubKey = decrypt(getUser(chatId)?.bayse_pub_key);
-      const match = await findMatchingMarket(signals, _pubKey);
+      const match = await findMatchingMarket(signals);
 
       if (!match) {
         return bot.sendMessage(
@@ -479,7 +476,7 @@ export function registerCommands(bot) {
         });
         return bot.sendMessage(
           chatId,
-          `✅ Threshold set to \`${val}\`\n\n*Step 2/3 — Max Trade Amount*\n\nMaximum amount per trade. Minimum recommended: \`3\`\n\nSend a number:`,
+          `✅ Threshold set to \`${val}\`\n\n*Step 2/2 — Max Trade Amount (USD)*\n\nMaximum amount per trade. Minimum recommended: \`3\`\n\nSend a number:`,
           { parse_mode: "Markdown" }
         );
       }
@@ -491,24 +488,11 @@ export function registerCommands(bot) {
         }
         updateUser(chatId, {
           max_trade_usd: val,
-          setup_step: SETUP_STEPS.AWAITING_CURRENCY,
+          setup_step: null,
         });
         return bot.sendMessage(
           chatId,
-          `✅ Max trade set to \`${val}\`\n\n*Step 3/3 — Currency*\n\nWhich currency do you want to trade in?\n\nReply \`USD\` or \`NGN\``,
-          { parse_mode: "Markdown" }
-        );
-      }
-
-      case SETUP_STEPS.AWAITING_CURRENCY: {
-        const val = text.toUpperCase().trim();
-        if (!["USD", "NGN"].includes(val)) {
-          return bot.sendMessage(chatId, `❌ Reply \`USD\` or \`NGN\``);
-        }
-        updateUser(chatId, { currency: val, setup_step: null });
-        return bot.sendMessage(
-          chatId,
-          `✅ *Setup Complete*\n\nThreshold: \`${user.threshold}\`\nMax Trade: \`${val} ${user.max_trade_usd}\`\nCurrency: \`${val}\`\n\nType /run to start the engine.`,
+          `✅ *Setup Complete*\n\nThreshold: \`${user.threshold}\`\nMax Trade: \`USD ${val}\`\n\nType /run to start the engine.`,
           { parse_mode: "Markdown" }
         );
       }
@@ -551,291 +535,4 @@ export function registerCommands(bot) {
   });
 
   bot.on("left_chat_member", (msg) => {
-    const isBot = msg.left_chat_member?.is_bot;
-    if (isBot) removeGroup(msg.chat.id);
-  });
-}
-
-// ─── Manual trading commands ──────────────────────────────────────────────────
-// Registered separately — call this from server.js after registerCommands()
-
-export function registerTradeCommands(bot) {
-  const TRADE_STEPS = {
-    AWAITING_MARKET_SEARCH: "trade_awaiting_search",
-    AWAITING_OUTCOME:       "trade_awaiting_outcome",
-    AWAITING_AMOUNT:        "trade_awaiting_amount",
-    AWAITING_CONFIRM:       "trade_awaiting_confirm",
-  };
-
-  // Store pending trade state per user in memory (cleared on confirm/cancel)
-  const pendingTrades = new Map();
-
-  // ── /trade — entry point ───────────────────────────────────────────────────
-  bot.onText(/\/trade/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user   = getUser(chatId);
-
-    if (!user?.bayse_pub_key || !user?.bayse_sec_key) {
-      return bot.sendMessage(chatId, `❌ Connect your Bayse keys first with /connect`);
-    }
-
-    updateUser(chatId, { setup_step: TRADE_STEPS.AWAITING_MARKET_SEARCH });
-
-    return bot.sendMessage(
-      chatId,
-      `🔎 *Manual Trade*\n\nSearch for a market to trade on.\n\nSend a keyword — e.g. \`bitcoin\`, \`nigeria\`, \`chelsea\`, \`election\``,
-      { parse_mode: "Markdown" }
-    );
-  });
-
-  // ── /cancel — abort any pending trade ─────────────────────────────────────
-  bot.onText(/\/cancel/, async (msg) => {
-    const chatId = msg.chat.id;
-    pendingTrades.delete(chatId);
-    updateUser(chatId, { setup_step: null });
-    return bot.sendMessage(chatId, `❌ Trade cancelled.`);
-  });
-
-  // ── Text handler — drives trade flow steps ────────────────────────────────
-  bot.on("message", async (msg) => {
-    if (msg.text?.startsWith("/")) return;
-    const chatId = msg.chat.id;
-    const text   = msg.text?.trim();
-    if (!text) return;
-
-    const user = getUser(chatId);
-    if (!user?.setup_step?.startsWith("trade_")) return;
-
-    switch (user.setup_step) {
-
-      // Step 1 — search markets by keyword
-      case TRADE_STEPS.AWAITING_MARKET_SEARCH: {
-        await bot.sendMessage(chatId, `🔄 _Searching markets for "${text}"..._`, { parse_mode: "Markdown" });
-
-        try {
-          const { getEvents: _getEvt } = await import("../bayse/client.js");
-          const _userPub = decrypt(user.bayse_pub_key);
-          const events = await _getEvt(_userPub, { status: "open", size: 50, keyword: text.toLowerCase() });
-
-          const keyword = text.toLowerCase();
-          const matches = events.filter((e) => {
-            const t = (e.title || "").toLowerCase();
-            const d = (e.description || "").toLowerCase();
-            return t.includes(keyword) || d.includes(keyword);
-          }).slice(0, 6);
-
-          if (!matches.length) {
-            return bot.sendMessage(
-              chatId,
-              `📭 No markets found for "*${text}*"\n\nTry a different keyword, or /markets to see all open markets.`,
-              { parse_mode: "Markdown" }
-            );
-          }
-
-          // Store results and show numbered list
-          pendingTrades.set(chatId, { searchResults: matches });
-          updateUser(chatId, { setup_step: TRADE_STEPS.AWAITING_OUTCOME });
-
-          const lines = matches.map((e, i) => {
-            const engine = e.engine ? ` \[${e.engine}\]` : "";
-            const openMarkets = (e.markets || []).filter(m => m.status === "open").length;
-            return `*${i + 1}.* ${e.title}${engine} — ${openMarkets} market(s)`;
-          });
-
-          return bot.sendMessage(
-            chatId,
-            `📋 *Events found:*\n\n${lines.join("\n\n")}\n\nReply with the *number* of the event you want to trade.\n\n_/cancel to abort_`,
-            { parse_mode: "Markdown" }
-          );
-        } catch (err) {
-          updateUser(chatId, { setup_step: null });
-          return bot.sendMessage(chatId, `❌ Search failed: ${err.message}`);
-        }
-      }
-
-      // Step 2 — pick event number → show all its markets with prices
-      case TRADE_STEPS.AWAITING_OUTCOME: {
-        const pending = pendingTrades.get(chatId);
-
-        // Sub-step 2a: user just sent event number
-        if (pending?.searchResults && !pending?.event) {
-          const num = parseInt(text);
-          if (isNaN(num) || num < 1 || num > pending.searchResults.length) {
-            return bot.sendMessage(chatId, `❌ Send a number between 1 and ${pending.searchResults.length}`);
-          }
-
-          const selectedEvent = pending.searchResults[num - 1];
-          const openMarkets   = (selectedEvent.markets || []).filter(m => m.status === "open");
-
-          if (!openMarkets.length) {
-            return bot.sendMessage(chatId, `❌ No open markets on that event. Try another.`);
-          }
-
-          // Build market display — show all outcomes with prices
-          const currency = user.currency || "USD";
-          const marketLines = openMarkets.map((m, i) => {
-            const yesPrice = m.outcome1Price ? `${(m.outcome1Price * 100).toFixed(0)}¢` : "—";
-            const noPrice  = m.outcome2Price ? `${(m.outcome2Price * 100).toFixed(0)}¢` : "—";
-            const label    = m.title || `${m.outcome1Label} vs ${m.outcome2Label}`;
-            return `*${i + 1}.* ${label}\n   YES ${yesPrice} | NO ${noPrice}`;
-          });
-
-          pendingTrades.set(chatId, { ...pending, event: selectedEvent, openMarkets });
-
-          return bot.sendMessage(
-            chatId,
-            `*${selectedEvent.title}*\n\n${marketLines.join("\n\n")}\n\nReply with: *market number* then *YES* or *NO*\ne.g. \`1 YES\` or \`2 NO\`\n\n_/cancel to abort_`,
-            { parse_mode: "Markdown" }
-          );
-        }
-
-        // Sub-step 2b: user sent market number + YES/NO
-        if (pending?.event && pending?.openMarkets) {
-          const parts   = text.toUpperCase().split(/\s+/);
-          const num     = parseInt(parts[0]);
-          const outcome = parts[1];
-
-          if (isNaN(num) || num < 1 || num > pending.openMarkets.length) {
-            return bot.sendMessage(chatId, `❌ Send market number (1–${pending.openMarkets.length}) then YES or NO\ne.g. \`1 YES\``);
-          }
-          if (!outcome || !["YES", "NO"].includes(outcome)) {
-            return bot.sendMessage(chatId, `❌ Include YES or NO\ne.g. \`${num} YES\``);
-          }
-
-          const market = pending.openMarkets[num - 1];
-          pendingTrades.set(chatId, { ...pending, market, outcome, openMarkets: undefined });
-          updateUser(chatId, { setup_step: TRADE_STEPS.AWAITING_AMOUNT });
-
-          const price = outcome === "YES"
-            ? market.outcome1Price ? `${(market.outcome1Price * 100).toFixed(0)}¢` : "—"
-            : market.outcome2Price ? `${(market.outcome2Price * 100).toFixed(0)}¢` : "—";
-
-          return bot.sendMessage(
-            chatId,
-            `✅ *${pending.event.title}*\n` +
-            `Market: ${market.title || market.outcome1Label}\n` +
-            `Position: *${outcome}* @ ${price}\n\n` +
-            `How much? (${user.currency || "USD"})\nMin: 1 | Your max: ${user.max_trade_usd || 5}\n\n_/cancel to abort_`,
-            { parse_mode: "Markdown" }
-          );
-        }
-
-        updateUser(chatId, { setup_step: null });
-        return bot.sendMessage(chatId, `❌ Session expired. Start again with /trade`);
-      }
-
-      // Step 3 — get amount, show quote
-      case TRADE_STEPS.AWAITING_AMOUNT: {
-        const amount = parseFloat(text);
-        if (isNaN(amount) || amount < 1) {
-          return bot.sendMessage(chatId, `❌ Enter a valid amount (minimum 1)`);
-        }
-
-        const pending = pendingTrades.get(chatId);
-        if (!pending?.event) {
-          updateUser(chatId, { setup_step: null });
-          return bot.sendMessage(chatId, `❌ Session expired. Start again with /trade`);
-        }
-
-        await bot.sendMessage(chatId, `🔄 _Getting quote..._`, { parse_mode: "Markdown" });
-
-        try {
-          const { getQuote, resolveOutcomeId } = await import("../bayse/client.js");
-          const { decrypt }  = await import("../utils/encryption.js");
-
-          const pubKey = decrypt(user.bayse_pub_key);
-          const currency = user.currency || "USD";
-          const outcomeId = resolveOutcomeId(pending.market, pending.outcome);
-
-          const quote = await getQuote(pubKey, pending.event.id, pending.market.id, outcomeId, "BUY", amount, currency);
-
-          pendingTrades.set(chatId, { ...pending, amount, quote });
-          updateUser(chatId, { setup_step: TRADE_STEPS.AWAITING_CONFIRM });
-
-          return bot.sendMessage(
-            chatId,
-            `📊 *Trade Quote*\n\n` +
-            `Event: *${pending.event.title}*\n` +
-            `Position: *BUY ${pending.outcome}*\n` +
-            `Amount: *${currency} ${amount}*\n\n` +
-            `Entry price: \`${(quote.price * 100).toFixed(1)}¢\`\n` +
-            `Shares: \`${quote.quantity?.toFixed(2) || "—"}\`\n` +
-            `Fee: \`${quote.fee?.toFixed(2) || "0"}\`\n` +
-            `Total cost: \`${currency} ${quote.amount?.toFixed(2) || amount}\`\n\n` +
-            `Reply *CONFIRM* to place this trade or /cancel to abort.`,
-            { parse_mode: "Markdown" }
-          );
-        } catch (err) {
-          updateUser(chatId, { setup_step: null });
-          pendingTrades.delete(chatId);
-          return bot.sendMessage(chatId, `❌ Quote failed: ${err.message}`);
-        }
-      }
-
-      // Step 4 — confirm and execute
-      case TRADE_STEPS.AWAITING_CONFIRM: {
-        if (text.toUpperCase() !== "CONFIRM") {
-          return bot.sendMessage(chatId, `Reply *CONFIRM* to place the trade or /cancel to abort.`, { parse_mode: "Markdown" });
-        }
-
-        const pending = pendingTrades.get(chatId);
-        if (!pending?.event) {
-          updateUser(chatId, { setup_step: null });
-          return bot.sendMessage(chatId, `❌ Session expired. Start again with /trade`);
-        }
-
-        await bot.sendMessage(chatId, `⚡ _Placing trade..._`, { parse_mode: "Markdown" });
-
-        try {
-          const { placeOrder, resolveOutcomeId: _resolve } = await import("../bayse/client.js");
-          const { decrypt }     = await import("../utils/encryption.js");
-          const { insertTrade } = await import("../db/database.js");
-
-          const pubKey   = decrypt(user.bayse_pub_key);
-          const secKey   = decrypt(user.bayse_sec_key);
-          const currency = user.currency || "USD";
-          const _outcomeId = _resolve(pending.market, pending.outcome);
-
-          const order = await placeOrder(pubKey, secKey, pending.event.id, pending.market.id, {
-            side: "BUY",
-            outcomeId: _outcomeId,
-            amount: pending.amount,
-            currency,
-          });
-
-          insertTrade({
-            chat_id:       String(chatId),
-            event_id:      pending.event.id,
-            market_id:     pending.market.id,
-            event_title:   pending.event.title,
-            signal_source: "manual",
-            confidence:    1.0,
-            side:          "BUY",
-            outcome:       pending.outcome,
-            amount:        pending.amount,
-            currency,
-            expected_price: pending.quote?.price || null,
-            status:        "open",
-          });
-
-          pendingTrades.delete(chatId);
-          updateUser(chatId, { setup_step: null });
-
-          return bot.sendMessage(
-            chatId,
-            `✅ *Trade Placed*\n\n` +
-            `*${pending.event.title}*\n` +
-            `BUY ${pending.outcome} | ${currency} ${pending.amount}\n` +
-            `Entry: \`${(pending.quote?.price * 100).toFixed(1)}¢\`\n\n` +
-            `_Track it with /trades_`,
-            { parse_mode: "Markdown" }
-          );
-        } catch (err) {
-          pendingTrades.delete(chatId);
-          updateUser(chatId, { setup_step: null });
-          return bot.sendMessage(chatId, `❌ Trade failed: ${err.message}`);
-        }
-      }
-    }
-  });
-}
+    const isBot = msg.left_chat_member?.is_b
