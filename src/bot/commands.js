@@ -224,7 +224,7 @@ export function registerCommands(bot) {
         `${crypto.best ? `${crypto.best.symbol} ${crypto.best.change1h}% (1h) | ${crypto.best.change24h}% (24h)` : crypto.error || "No data"}\n\n` +
         `*Sports* ${sports.direction === "home" ? "🟢" : sports.direction ? "🔴" : "⚪"}\n` +
         `${signalBar(sports.score)}\n` +
-        `${sports.best ? `${sports.best.homeTeam} vs ${sports.best.awayTeam}` : sports.reason || "No fixtures"}\n\n` +
+        `${sports.best ? sports.best.title?.slice(0, 60) || "Active market" : sports.reason || "No sports markets"}\n\n` +
         `*Sentiment* ${sentiment.direction === "bullish" ? "🟢" : sentiment.direction ? "🔴" : "⚪"}\n` +
         `${signalBar(sentiment.score)}\n` +
         `${sentiment.best ? `"${sentiment.best.title.slice(0, 60)}..."` : sentiment.reason || "No headlines"}\n\n` +
