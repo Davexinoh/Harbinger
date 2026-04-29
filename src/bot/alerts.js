@@ -7,6 +7,17 @@ export function setBot(botInstance) {
   bot = botInstance;
 }
 
+// Escape Markdown special chars in dynamic content (event titles, usernames etc)
+function esc(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/\*/g, "\\*")
+    .replace(/_/g, "\\_")
+    .replace(/`/g, "\\`")
+    .replace(/\[/g, "\\[");
+}
+
 function signalBar(score) {
   const filled = Math.round(score * 10);
   return "█".repeat(filled) + "░".repeat(10 - filled) + ` ${(score * 100).toFixed(0)}%`;
@@ -34,18 +45,18 @@ export async function sendTradeAlert(chatId, result, signals, decision, errorMsg
     const { tradeRecord, quote } = result;
     const { crypto, sports, sentiment } = signals;
     const price       = quote.price || quote.expectedPrice;
-    const outcomeLabel = result.outcomeLabel || tradeRecord.outcome;
+    const outcomeLabel = result.outcomeLabel || tradeRecord.outcome_label || tradeRecord.outcome;
 
     msg =
       `🎯 *Trade Executed*\n\n` +
-      `📋 *Event:* ${tradeRecord.event_title}\n` +
-      `📌 *Position:* ${tradeRecord.side} ${tradeRecord.outcome}\n` +
-      `💰 *Amount:* ${tradeRecord.currency} ${tradeRecord.amount}\n` +
+      `📋 *Event:* ${esc(tradeRecord.event_title)}\n` +
+      `📌 *Position:* ${esc(tradeRecord.side)} ${esc(outcomeLabel)}\n` +
+      `💰 *Amount:* ${esc(tradeRecord.currency)} ${tradeRecord.amount}\n` +
       `📈 *Entry Price:* ${(price * 100).toFixed(1)}¢\n` +
-      `🧠 *Lead Signal:* ${tradeRecord.signal_source.toUpperCase()} (${(tradeRecord.confidence * 100).toFixed(0)}%)\n\n` +
+      `🧠 *Lead Signal:* ${esc(tradeRecord.signal_source.toUpperCase())} (${(tradeRecord.confidence * 100).toFixed(0)}%)\n\n` +
       `*Signal Breakdown*\n` +
-      `Crypto   ${directionEmoji(crypto.direction)} ${signalBar(crypto.score)}\n` +
-      `Sports   ${directionEmoji(sports.direction)} ${signalBar(sports.score)}\n` +
+      `Crypto    ${directionEmoji(crypto.direction)} ${signalBar(crypto.score)}\n` +
+      `Sports    ${directionEmoji(sports.direction)} ${signalBar(sports.score)}\n` +
       `Sentiment ${directionEmoji(sentiment.direction)} ${signalBar(sentiment.score)}\n` +
       `Composite ⚡ ${signalBar(decision.composite)}\n\n` +
       `_/trades to see full history_`;
@@ -57,7 +68,7 @@ export async function sendTradeAlert(chatId, result, signals, decision, errorMsg
 export async function broadcastToGroups(signals, forcePoll = false) {
   if (!bot) return;
 
-  const groups = getGroups();
+  const groups = await getGroups();
   if (!groups.length) return;
 
   const { crypto, sports, sentiment, composite } = signals;
