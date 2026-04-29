@@ -370,8 +370,8 @@ export function registerCommands(bot) {
     const chatId = msg.chat.id;
     const { getCrowdIQReport, getRecentPolls } = await import("../signals/crowdSignal.js");
     const stats  = getCrowdIQReport();
-    const recent = getRecentPolls(5);
-
+    const recent = await getRecentPolls(5);
+  
     if (!stats || stats.total_polls === 0) {
       return bot.sendMessage(
         chatId,
