@@ -5,71 +5,107 @@ import { decrypt } from "../utils/encryption.js";
 export async function executeTrade(user, match, decision) {
   const publicKey = decrypt(user.bayse_pub_key);
   const secretKey = decrypt(user.bayse_sec_key);
-  if (!publicKey || !secretKey) throw new Error("Missing Bayse API keys");
+
+  if (!publicKey || !secretKey) {
+    throw new Error("Missing Bayse API keys");
+  }
 
   const { event, market, suggestedOutcome, signalSource, signalScore } = match;
   const currency = user.currency || "USD";
-  const side     = "BUY";
+  const side = "BUY";
 
-  const rawAmount  = decision.amount;
-  const safeAmount = currency === "NGN"
-    ? Math.max(Math.round(rawAmount), 100)
-    : Math.max(parseFloat(rawAmount.toFixed(2)), 1);
+  // ─── Amount validation ───────────────────────────────────────────────
+  const rawAmount = Number(decision.amount);
 
-  // Resolve outcomeId — guard against null
-  const resolved = resolveOutcomeId(market, suggestedOutcome);
+  if (!rawAmount || isNaN(rawAmount)) {
+    throw new Error(`Invalid amount: ${decision.amount}`);
+  }
 
-  if (!resolved || !resolved.outcomeId) {
-    // Log market structure to help debug
-    console.error(`[Executor] Cannot resolve outcomeId for ${suggestedOutcome}. Market:`, JSON.stringify({
-      outcome1Id:    market.outcome1Id,
-      outcome1Label: market.outcome1Label,
-      outcome2Id:    market.outcome2Id,
-      outcome2Label: market.outcome2Label,
-    }));
-    throw new Error(`outcomeId is null for ${suggestedOutcome} — market may have unexpected structure`);
+  const amount =
+    currency === "NGN"
+      ? Math.max(Math.round(rawAmount), 100) // minimum ₦100
+      : Math.max(parseFloat(rawAmount.toFixed(2)), 1); // minimum $1
+
+  // ─── Resolve outcomeId correctly (FIXED) ─────────────────────────────
+  const { outcomeId } = resolveOutcomeId(market, suggestedOutcome);
+
+  if (!outcomeId || typeof outcomeId !== "string") {
+    throw new Error(
+      `Invalid outcomeId resolved: ${JSON.stringify(outcomeId)}`
+    );
   }
 
   console.log(
-    `[Executor] ➜ "${event.title}" | BUY ${resolved.outcomeLabel} (${resolved.outcomeId}) | ` +
-    `${currency} ${safeAmount} | ${signalSource} ${(signalScore * 100).toFixed(0)}%`
+    `[Executor] Quoting: ${event.title} | ${side} ${suggestedOutcome} | ${currency} ${amount}`
   );
 
-  // Quote
+  // ─── Step 1: Get quote ───────────────────────────────────────────────
   const quote = await getQuote(
-    publicKey, event.id, market.id, resolved.outcomeId, side, safeAmount, currency
+    publicKey,
+    event.id,
+    market.id,
+    outcomeId,
+    side,
+    amount,
+    currency
   );
 
   const price = quote.price || quote.expectedPrice;
-  if (!price || price < 0.03 || price > 0.97) {
+
+  if (price == null) {
+    throw new Error("Quote missing price");
+  }
+
+  // Avoid extreme prices
+  if (price < 0.03 || price > 0.97) {
     throw new Error(`Market price ${price} at extreme — skipping`);
   }
 
-  // Order
-  const order = await placeOrder(publicKey, secretKey, event.id, market.id, {
+  // ─── Step 2: Place order ─────────────────────────────────────────────
+  const orderPayload = {
     side,
-    outcomeId: resolved.outcomeId,
-    amount:    safeAmount,
-    type:      "MARKET",
+    outcomeId,
+    amount,
+    type: "MARKET",
     currency,
-  });
-
-  const tradeRecord = {
-    chat_id:        String(user.chat_id),
-    event_id:       event.id,
-    market_id:      market.id,
-    event_title:    event.title || "Unknown Event",
-    outcome_label:  resolved.outcomeLabel,
-    signal_source:  signalSource,
-    confidence:     signalScore,
-    side,
-    outcome:        suggestedOutcome,
-    amount:         safeAmount,
-    currency,
-    expected_price: price,
-    status:         "open",
   };
 
-  const result = await insertTrade(tradeRecord);
-  return { tradeId: result.id, order, quote, tradeRecord, outcomeLabel: resolved.outcomeLabel };
+  console.log("[EXECUTE ORDER]", {
+    eventId: event.id,
+    marketId: market.id,
+    orderPayload,
+  });
+
+  const order = await placeOrder(
+    publicKey,
+    secretKey,
+    event.id,
+    market.id,
+    orderPayload
+  );
+
+  // ─── Step 3: Log trade ───────────────────────────────────────────────
+  const tradeRecord = {
+    chat_id: String(user.chat_id),
+    event_id: event.id,
+    market_id: market.id,
+    event_title: event.title || "Unknown Event",
+    signal_source: signalSource,
+    confidence: signalScore,
+    side,
+    outcome: suggestedOutcome,
+    amount,
+    currency,
+    expected_price: price,
+    status: "open",
+  };
+
+  const result = insertTrade(tradeRecord);
+
+  return {
+    tradeId: result.lastInsertRowid,
+    order,
+    quote,
+    tradeRecord,
+  };
 }
