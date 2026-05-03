@@ -3,11 +3,34 @@ import { postCrowdPoll } from "../signals/crowdSignal.js";
 
 let bot = null;
 
+// HARD KILL SWITCH (this is what you were missing)
+let alertsEnabled = true;
+
 export function setBot(botInstance) {
   bot = botInstance;
 }
 
-// Escape Markdown special chars in dynamic content (event titles, usernames etc)
+export function stopAlerts() {
+  alertsEnabled = false;
+}
+
+export function startAlerts() {
+  alertsEnabled = true;
+}
+
+// Prevent spam bursts
+const lastSent = new Map();
+const MIN_INTERVAL_MS = 60_000; // 1 min per group
+
+function canSend(groupId) {
+  const now = Date.now();
+  const last = lastSent.get(groupId) || 0;
+  if (now - last < MIN_INTERVAL_MS) return false;
+  lastSent.set(groupId, now);
+  return true;
+}
+
+// Safer escape (full markdown safety)
 function esc(text) {
   if (!text) return "";
   return String(text)
@@ -15,96 +38,87 @@ function esc(text) {
     .replace(/\*/g, "\\*")
     .replace(/_/g, "\\_")
     .replace(/`/g, "\\`")
-    .replace(/\[/g, "\\[");
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]");
 }
 
-function signalBar(score) {
-  const filled = Math.round(score * 10);
-  return "█".repeat(filled) + "░".repeat(10 - filled) + ` ${(score * 100).toFixed(0)}%`;
+function signalBar(score = 0) {
+  const clamped = Math.max(0, Math.min(1, score));
+  const filled = Math.round(clamped * 10);
+  return "█".repeat(filled) + "░".repeat(10 - filled) + ` ${(clamped * 100).toFixed(0)}%`;
 }
 
 function directionEmoji(direction) {
   if (!direction) return "⚪";
-  const d = direction.toLowerCase();
-  if (d === "up" || d === "bullish" || d === "yes" || d === "home") return "🟢";
-  return "🔴";
+  const d = String(direction).toLowerCase();
+  if (["up", "bullish", "yes", "home"].includes(d)) return "🟢";
+  if (["down", "bearish", "no", "away"].includes(d)) return "🔴";
+  return "⚪";
 }
 
 export async function sendTradeAlert(chatId, result, signals, decision, errorMsg = null) {
-  if (!bot) return;
+  if (!bot || !alertsEnabled) return;
 
   let msg;
 
   if (errorMsg || !result) {
     msg =
-      `⚠️ *Trade Attempt Failed*\n\n` +
-      `Composite confidence: \`${(decision.composite * 100).toFixed(1)}%\`\n` +
-      `Error: ${errorMsg || "Unknown error"}\n\n` +
-      `_Engine continues running._`;
+      `⚠️ *Trade Failed*\n\n` +
+      `Confidence: ${(decision?.composite * 100 || 0).toFixed(1)}%\n` +
+      `Error: ${esc(errorMsg || "Unknown")}\n`;
   } else {
     const { tradeRecord, quote } = result;
-    const { crypto, sports, sentiment, btc15m, fx } = signals;
-    const price       = quote.price || quote.expectedPrice;
-    const outcomeLabel = result.outcomeLabel || tradeRecord.outcome_label || tradeRecord.outcome;
+    const price = quote?.price || quote?.expectedPrice || 0;
+    const outcomeLabel = result?.outcomeLabel || tradeRecord?.outcome;
 
     msg =
       `🎯 *Trade Executed*\n\n` +
-      `📋 *Event:* ${esc(tradeRecord.event_title)}\n` +
-      `📌 *Position:* ${esc(tradeRecord.side)} ${esc(outcomeLabel)}\n` +
-      `💰 *Amount:* ${esc(tradeRecord.currency)} ${tradeRecord.amount}\n` +
-      `📈 *Entry Price:* ${(price * 100).toFixed(1)}¢\n` +
-      `🧠 *Lead Signal:* ${esc(tradeRecord.signal_source.toUpperCase())} (${(tradeRecord.confidence * 100).toFixed(0)}%)\n\n` +
-      `*Signal Breakdown*\n` +
-      `₿ BTC15m  ${directionEmoji(btc15m?.direction)} ${signalBar(btc15m?.score || 0)}\n` +
-      `Crypto    ${directionEmoji(crypto.direction)} ${signalBar(crypto.score)}\n` +
-      `Sports    ${directionEmoji(sports.direction)} ${signalBar(sports.score)}\n` +
-      `FX        ${directionEmoji(fx?.direction)} ${signalBar(fx?.score || 0)}\n` +
-      `Sentiment ${directionEmoji(sentiment.direction)} ${signalBar(sentiment.score)}\n` +
-      `Composite ⚡ ${signalBar(decision.composite)}\n\n` +
-      `_/trades to see full history_`;
+      `Event: ${esc(tradeRecord.event_title)}\n` +
+      `Side: ${esc(tradeRecord.side)} ${esc(outcomeLabel)}\n` +
+      `Amount: ${esc(tradeRecord.currency)} ${tradeRecord.amount}\n` +
+      `Entry: ${(price * 100).toFixed(1)}¢\n` +
+      `Signal: ${esc(tradeRecord.signal_source)}\n\n` +
+      `Composite: ${(decision.composite * 100).toFixed(0)}%`;
   }
 
   await bot.sendMessage(chatId, msg, { parse_mode: "Markdown" });
 }
 
 export async function broadcastToGroups(signals, forcePoll = false) {
-  if (!bot) return;
+  if (!bot || !alertsEnabled) return;
 
   const groups = await getGroups();
   if (!groups.length) return;
 
   const { crypto, sports, sentiment, composite } = signals;
 
-  // If forcePoll — post a fresh crowd poll instead of a signal broadcast
+  // Optional crowd poll mode
   if (forcePoll && composite >= 0.55) {
     try {
       await postCrowdPoll(signals, null);
     } catch (err) {
-      console.error("[Alerts] Force poll error:", err.message);
+      console.error("[Alerts] Poll error:", err.message);
     }
     return;
   }
 
-  // Signal broadcast only when composite is meaningfully elevated
+  // HARD THRESHOLD CONTROL
   if (composite < 0.60) return;
 
-  const intensity = composite >= 0.65 ? "🔥 HOT" : "⚡ WARM";
-
   const msg =
-    `${intensity} *Harbinger Signal Update*\n\n` +
-    `Crypto   ${directionEmoji(crypto.direction)} ${signalBar(crypto.score)}\n` +
-    `Sports   ${directionEmoji(sports.direction)} ${signalBar(sports.score)}\n` +
-    `Sentiment ${directionEmoji(sentiment.direction)} ${signalBar(sentiment.score)}\n` +
-    `━━━━━━━━━━━━━━\n` +
-    `Composite ⚡ ${signalBar(composite)}\n\n` +
-    (composite >= 0.65 ? `🎯 *Threshold breached — trades may be executing*\n\n` : "") +
-    `_Start your own engine → @Harbingerbayse_bot_`;
+    `${composite >= 0.65 ? "🔥 HOT" : "⚡ WARM"} *Signal Update*\n\n` +
+    `Crypto ${directionEmoji(crypto.direction)} ${signalBar(crypto.score)}\n` +
+    `Sports ${directionEmoji(sports.direction)} ${signalBar(sports.score)}\n` +
+    `Sentiment ${directionEmoji(sentiment.direction)} ${signalBar(sentiment.score)}\n\n` +
+    `Composite ⚡ ${signalBar(composite)}`;
 
   for (const group of groups) {
+    if (!canSend(group.group_id)) continue;
+
     try {
       await bot.sendMessage(group.group_id, msg, { parse_mode: "Markdown" });
     } catch (err) {
-      console.error(`[Alerts] Group ${group.group_id} send failed:`, err.message);
+      console.error("[Alerts] Send failed:", err.message);
     }
   }
 }
