@@ -11,35 +11,39 @@ export async function executeTrade(user, match, decision) {
   }
 
   const { event, market, suggestedOutcome, signalSource, signalScore } = match;
+
   const currency = user.currency || "USD";
   const side = "BUY";
 
-  // ─── Amount validation ───────────────────────────────────────────────
   const rawAmount = Number(decision.amount);
 
-  if (!rawAmount || isNaN(rawAmount)) {
+  if (!Number.isFinite(rawAmount)) {
     throw new Error(`Invalid amount: ${decision.amount}`);
   }
 
-  const amount =
-    currency === "NGN"
-      ? Math.max(Math.round(rawAmount), 100) // minimum ₦100
-      : Math.max(parseFloat(rawAmount.toFixed(2)), 1); // minimum $1
+  const maxCap = Number.isFinite(Number(user.max_trade_amount))
+    ? Number(user.max_trade_amount)
+    : currency === "NGN"
+      ? 500
+      : 5;
 
-  // ─── Resolve outcomeId correctly (FIXED) ─────────────────────────────
+  const amountUncapped =
+    currency === "NGN"
+      ? Math.max(Math.round(rawAmount), 100)
+      : Math.max(parseFloat(rawAmount.toFixed(2)), 1);
+
+  const amount = Math.min(amountUncapped, maxCap);
+
   const { outcomeId } = resolveOutcomeId(market, suggestedOutcome);
 
   if (!outcomeId || typeof outcomeId !== "string") {
-    throw new Error(
-      `Invalid outcomeId resolved: ${JSON.stringify(outcomeId)}`
-    );
+    throw new Error(`Invalid outcomeId resolved: ${JSON.stringify(outcomeId)}`);
   }
 
   console.log(
-    `[Executor] Quoting: ${event.title} | ${side} ${suggestedOutcome} | ${currency} ${amount}`
+    `[Executor] ${event.title} | ${side} ${suggestedOutcome} | ${currency} ${amount}`
   );
 
-  // ─── Step 1: Get quote ───────────────────────────────────────────────
   const quote = await getQuote(
     publicKey,
     event.id,
@@ -56,12 +60,10 @@ export async function executeTrade(user, match, decision) {
     throw new Error("Quote missing price");
   }
 
-  // Avoid extreme prices
   if (price < 0.03 || price > 0.97) {
-    throw new Error(`Market price ${price} at extreme — skipping`);
+    throw new Error(`Market price ${price} too extreme`);
   }
 
-  // ─── Step 2: Place order ─────────────────────────────────────────────
   const orderPayload = {
     side,
     outcomeId,
@@ -84,7 +86,6 @@ export async function executeTrade(user, match, decision) {
     orderPayload
   );
 
-  // ─── Step 3: Log trade ───────────────────────────────────────────────
   const tradeRecord = {
     chat_id: String(user.chat_id),
     event_id: event.id,
@@ -100,7 +101,7 @@ export async function executeTrade(user, match, decision) {
     status: "open",
   };
 
-  const result = insertTrade(tradeRecord);
+  const result = await insertTrade(tradeRecord);
 
   return {
     tradeId: result.lastInsertRowid,
