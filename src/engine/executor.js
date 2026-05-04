@@ -2,12 +2,18 @@ import { getQuote, placeOrder, resolveOutcomeId } from "../bayse/client.js";
 import { insertTrade } from "../db/database.js";
 import { decrypt } from "../utils/encryption.js";
 
+const ACTIVE_TRADES = new Set(); // idempotency guard
+
+function tradeKey(eventId, marketId, outcomeId) {
+  return `${eventId}:${marketId}:${outcomeId}`;
+}
+
 export async function executeTrade(user, match, decision) {
   const publicKey = decrypt(user.bayse_pub_key);
   const secretKey = decrypt(user.bayse_sec_key);
 
   if (!publicKey || !secretKey) {
-    throw new Error("Missing Bayse API keys");
+    throw new Error("Missing API keys");
   }
 
   const { event, market, suggestedOutcome, signalSource, signalScore } = match;
@@ -16,97 +22,92 @@ export async function executeTrade(user, match, decision) {
   const side = "BUY";
 
   const rawAmount = Number(decision.amount);
-
   if (!Number.isFinite(rawAmount)) {
-    throw new Error(`Invalid amount: ${decision.amount}`);
+    throw new Error("Invalid trade amount");
   }
-
-  const maxCap = Number.isFinite(Number(user.max_trade_amount))
-    ? Number(user.max_trade_amount)
-    : currency === "NGN"
-      ? 500
-      : 5;
-
-  const amountUncapped =
-    currency === "NGN"
-      ? Math.max(Math.round(rawAmount), 100)
-      : Math.max(parseFloat(rawAmount.toFixed(2)), 1);
-
-  const amount = Math.min(amountUncapped, maxCap);
 
   const { outcomeId } = resolveOutcomeId(market, suggestedOutcome);
-
-  if (!outcomeId || typeof outcomeId !== "string") {
-    throw new Error(`Invalid outcomeId resolved: ${JSON.stringify(outcomeId)}`);
+  if (typeof outcomeId !== "string") {
+    throw new Error("Invalid outcome resolution");
   }
 
-  console.log(
-    `[Executor] ${event.title} | ${side} ${suggestedOutcome} | ${currency} ${amount}`
-  );
-
-  const quote = await getQuote(
-    publicKey,
-    event.id,
-    market.id,
-    outcomeId,
-    side,
-    amount,
-    currency
-  );
-
-  const price = quote.price || quote.expectedPrice;
-
-  if (price == null) {
-    throw new Error("Quote missing price");
+  const key = tradeKey(event.id, market.id, outcomeId);
+  if (ACTIVE_TRADES.has(key)) {
+    throw new Error("Duplicate trade blocked");
   }
+  ACTIVE_TRADES.add(key);
 
-  if (price < 0.03 || price > 0.97) {
-    throw new Error(`Market price ${price} too extreme`);
+  try {
+    const maxCap = Number.isFinite(Number(user.max_trade_amount))
+      ? Number(user.max_trade_amount)
+      : currency === "NGN" ? 500 : 5;
+
+    const amount = Math.min(
+      currency === "NGN" ? Math.max(Math.round(rawAmount), 100) : Math.max(rawAmount, 1),
+      maxCap
+    );
+
+    const quote = await getQuote(
+      publicKey,
+      event.id,
+      market.id,
+      outcomeId,
+      side,
+      amount,
+      currency
+    );
+
+    const price = quote?.price ?? quote?.expectedPrice;
+    if (!Number.isFinite(price)) {
+      throw new Error("Invalid quote price");
+    }
+
+    if (price < 0.03 || price > 0.97) {
+      throw new Error("Unsafe market price detected");
+    }
+
+    const orderPayload = {
+      side,
+      outcomeId,
+      amount,
+      type: "MARKET",
+      currency,
+    };
+
+    const order = await placeOrder(
+      publicKey,
+      secretKey,
+      event.id,
+      market.id,
+      orderPayload
+    );
+
+    const tradeRecord = {
+      chat_id: String(user.chat_id),
+      event_id: event.id,
+      market_id: market.id,
+      event_title: event.title || "Unknown",
+      signal_source: signalSource,
+      confidence: signalScore,
+      side,
+      outcome: suggestedOutcome,
+      amount,
+      currency,
+      expected_price: price,
+      status: "open",
+      created_at: new Date().toISOString(),
+    };
+
+    const result = await insertTrade(tradeRecord);
+
+    return {
+      tradeId: result.lastInsertRowid,
+      order,
+      quote,
+      tradeRecord,
+    };
+
+  } finally {
+    ACTIVE_TRADES.delete(key);
   }
-
-  const orderPayload = {
-    side,
-    outcomeId,
-    amount,
-    type: "MARKET",
-    currency,
-  };
-
-  console.log("[EXECUTE ORDER]", {
-    eventId: event.id,
-    marketId: market.id,
-    orderPayload,
-  });
-
-  const order = await placeOrder(
-    publicKey,
-    secretKey,
-    event.id,
-    market.id,
-    orderPayload
-  );
-
-  const tradeRecord = {
-    chat_id: String(user.chat_id),
-    event_id: event.id,
-    market_id: market.id,
-    event_title: event.title || "Unknown Event",
-    signal_source: signalSource,
-    confidence: signalScore,
-    side,
-    outcome: suggestedOutcome,
-    amount,
-    currency,
-    expected_price: price,
-    status: "open",
-  };
-
-  const result = await insertTrade(tradeRecord);
-
-  return {
-    tradeId: result.lastInsertRowid,
-    order,
-    quote,
-    tradeRecord,
-  };
 }
