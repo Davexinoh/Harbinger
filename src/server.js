@@ -2,14 +2,14 @@ import "dotenv/config";
 import express    from "express";
 import fetch      from "node-fetch";
 import TelegramBot from "node-telegram-bot-api";
-import { registerCommands, registerTradeCommands } from "./bot/commands.js";
-import { registerMarketMakerCommands }             from "./bot/marketMakerCommands.js";
-import { setBot }                                  from "./bot/alerts.js";
+import { registerCommands }                            from "./bot/commands.js";
+import { registerMarketMakerCommands }                 from "./bot/marketMakerCommands.js";
+import { setBot }                                      from "./bot/alerts.js";
 import { setCrowdBot, registerPollHandler, getCrowdIQReport, getRecentPolls } from "./signals/crowdSignal.js";
-import { startEngine }                             from "./engine/engineLoop.js";
-import { startTradeResolver, setResolverBot }      from "./engine/tradeResolver.js";
-import { setMarketMakerBot }                       from "./engine/marketMaker.js";
-import { initSchema }                              from "./db/database.js";
+import { startEngine }                                 from "./engine/engineLoop.js";
+import { startTradeResolver, setResolverBot }          from "./engine/tradeResolver.js";
+import { setMarketMakerBot }                           from "./engine/marketMaker.js";
+import { initSchema }                                  from "./db/database.js";
 
 const PORT  = process.env.PORT || 3001;
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -25,7 +25,6 @@ setResolverBot(bot);
 setMarketMakerBot(bot);
 
 registerCommands(bot);
-registerTradeCommands(bot);
 registerMarketMakerCommands(bot);
 registerPollHandler(bot);
 
