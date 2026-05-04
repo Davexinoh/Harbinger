@@ -13,16 +13,17 @@ const TICK_MS = 60_000;
 const MIN_TRADE_GAP_MS = 15 * 60 * 1000;
 
 // --- Global guards ---
-let ticking = false;
+let ticking   = false;
 let isRunning = false;
 let tickTimer = null;
+let activeUserCount = 0;
 
 // --- Per-user locks ---
 const userLocks = new Map();
 
 // --- Trade dedup ---
 const executedKeys = new Set();
-const EXEC_WINDOW = 60_000;
+const EXEC_WINDOW  = 60_000;
 
 function makeTradeKey(userId, eventId) {
   const bucket = Math.floor(Date.now() / EXEC_WINDOW);
@@ -44,7 +45,6 @@ export function startEngine() {
   if (isRunning) return;
   isRunning = true;
   console.log("[Engine] Started");
-
   tick();
   tickTimer = setInterval(tick, TICK_MS);
 }
@@ -61,20 +61,19 @@ async function tick() {
 
   try {
     const users = await getActiveUsers();
+    activeUserCount = users.length;
     if (!users.length) return;
 
     const signals = await runAllSignals();
     console.log(`[Engine] composite=${signals.composite.toFixed(2)}`);
 
-    // broadcast only on meaningful signals
     if (signals.composite >= 0.60) {
       await broadcastSignals(signals);
     }
 
-    // compute shared market once
-    const pubKey = decrypt(users[0].bayse_pub_key);
+    const pubKey   = decrypt(users[0].bayse_pub_key);
     const unsettled = await getUnsettledEventIds(users[0].chat_id);
-    const match = await findMatchingMarket(signals, pubKey, unsettled);
+    const match    = await findMatchingMarket(signals, pubKey, unsettled);
 
     for (const user of users) {
       processUserSafe(user, signals, match);
@@ -90,10 +89,8 @@ async function tick() {
 // --- Safe wrapper with lock ---
 async function processUserSafe(user, signals, match) {
   const id = user.chat_id;
-
   if (userLocks.get(id)) return;
   userLocks.set(id, true);
-
   try {
     await processUser(user, signals, match);
   } finally {
@@ -111,19 +108,17 @@ async function processUser(user, signals, match) {
   const decision = shouldTrade(signals, fresh);
   if (!decision.fire) return;
 
-  // cooldown
   const last = lastTradeTimes.get(chatId) || 0;
   if (Date.now() - last < MIN_TRADE_GAP_MS) return;
 
   if (!match) return;
 
-  // idempotency
   const key = makeTradeKey(chatId, match.event.id);
   if (isDuplicateTrade(key)) return;
 
-  // amount calc (cleaned)
-  const currency = fresh.currency || "USD";
-  const max = parseFloat(fresh.max_trade_usd) || (currency === "NGN" ? 500 : 5);
+  // FIX: was reading max_trade_usd (undefined) — correct column is max_trade_amount
+  const currency  = fresh.currency || "USD";
+  const max       = parseFloat(fresh.max_trade_amount) || (currency === "NGN" ? 500 : 5);
   const threshold = parseFloat(fresh.threshold) || 0.6;
 
   const scale = Math.min((signals.composite - threshold) / (0.95 - threshold), 1);
@@ -137,27 +132,25 @@ async function processUser(user, signals, match) {
 
   decision.amount = amount;
 
-  // FINAL lifecycle check (critical)
+  // Final lifecycle check
   const latest = await getUser(chatId);
   if (!latest?.engine_active) return;
 
   try {
     const result = await executeTrade(latest, match, decision);
-
     lastTradeTimes.set(chatId, Date.now());
-
     await sendTradeAlert(chatId, result, decision);
-
     console.log(`[Engine] ${chatId} ✓ ${match.event.title}`);
   } catch (err) {
     lastTradeTimes.set(chatId, Date.now());
-
     await sendTradeAlert(chatId, null, decision, err.message);
-
     console.error(`[Engine] ${chatId} failed:`, err.message);
   }
 }
 
 export function getEngineStatus() {
-  return { running: isRunning };
+  return {
+    running:     isRunning,
+    activeUsers: activeUserCount,
+  };
 }
