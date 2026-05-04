@@ -22,12 +22,6 @@ function isDuplicate(key) {
   return false;
 }
 
-// --- Escape ---
-function esc(text) {
-  if (!text) return "";
-  return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
-}
-
 // --- UI helpers ---
 function bar(score = 0) {
   const s = Math.max(0, Math.min(1, score));
@@ -38,62 +32,68 @@ function bar(score = 0) {
 function emoji(dir) {
   if (!dir) return "⚪";
   const d = dir.toLowerCase();
-  if (["up","bullish","yes","home"].includes(d)) return "🟢";
-  if (["down","bearish","no","away"].includes(d)) return "🔴";
+  if (["up", "bullish", "yes", "home"].includes(d)) return "🟢";
+  if (["down", "bearish", "no", "away"].includes(d)) return "🔴";
   return "⚪";
 }
 
-// --- PUBLIC API (still sends, but controlled + deduped) ---
-
+// --- Trade alert (DM to user) ---
 export async function sendTradeAlert(chatId, result, decision, errorMsg = null) {
   if (!bot) return;
 
   let msg;
 
   if (errorMsg || !result) {
+    const confidence = ((decision?.composite ?? 0) * 100).toFixed(1);
+    const err = String(errorMsg || "Unknown error");
     msg =
-      `⚠️ *Trade Failed*\n\n` +
-      `Confidence: ${(decision?.composite * 100 || 0).toFixed(1)}%\n` +
-      `Error: ${esc(errorMsg || "Unknown")}`;
+      `⚠️ Trade Attempt Failed\n\n` +
+      `Composite confidence: ${confidence}%\n` +
+      `Error: ${err}\n\n` +
+      `Engine continues running.`;
   } else {
     const { tradeRecord, quote } = result;
-    const price = quote?.price || quote?.expectedPrice || 0;
+    const price = quote?.price ?? quote?.expectedPrice ?? 0;
+    const confidence = (decision.composite * 100).toFixed(0);
 
     msg =
-      `🎯 *Trade Executed*\n\n` +
-      `Event: ${esc(tradeRecord.event_title)}\n` +
-      `Side: ${esc(tradeRecord.side)} ${esc(tradeRecord.outcome)}\n` +
-      `Amount: ${esc(tradeRecord.currency)} ${tradeRecord.amount}\n` +
-      `Entry: ${(price * 100).toFixed(1)}¢\n\n` +
-      `Composite: ${(decision.composite * 100).toFixed(0)}%`;
+      `✅ Trade Executed\n\n` +
+      `Event: ${tradeRecord.event_title}\n` +
+      `Side: ${tradeRecord.side} ${tradeRecord.outcome}\n` +
+      `Amount: ${tradeRecord.currency} ${tradeRecord.amount}\n` +
+      `Entry: ${(price * 100).toFixed(1)}c\n\n` +
+      `Composite: ${confidence}%`;
   }
 
   try {
-    await bot.sendMessage(chatId, msg, { parse_mode: "MarkdownV2" });
+    await bot.sendMessage(chatId, msg);
   } catch (err) {
     console.error("[Alert] sendTradeAlert:", err.message);
   }
 }
 
+// --- Signal broadcast (to groups) ---
 export async function broadcastSignals(signals) {
   if (!bot) return;
 
   const groups = await getGroups();
   if (!groups.length) return;
 
+  const heat = signals.composite >= 0.65 ? "🔥 HOT" : "⚡ WARM";
+
   const msg =
-    `${signals.composite >= 0.65 ? "🔥 HOT" : "⚡ WARM"} *Signal Update*\n\n` +
-    `Crypto ${emoji(signals.crypto.direction)} ${bar(signals.crypto.score)}\n` +
-    `Sports ${emoji(signals.sports.direction)} ${bar(signals.sports.score)}\n` +
-    `Sentiment ${emoji(signals.sentiment.direction)} ${bar(signals.sentiment.score)}\n\n` +
-    `Composite ⚡ ${bar(signals.composite)}`;
+    `${heat} Signal Update\n\n` +
+    `Crypto    ${emoji(signals.crypto?.direction)} ${bar(signals.crypto?.score)}\n` +
+    `Sports    ${emoji(signals.sports?.direction)} ${bar(signals.sports?.score)}\n` +
+    `Sentiment ${emoji(signals.sentiment?.direction)} ${bar(signals.sentiment?.score)}\n\n` +
+    `Composite ${bar(signals.composite)}`;
 
   for (const g of groups) {
     const key = makeKey(g.group_id, msg);
     if (isDuplicate(key)) continue;
 
     try {
-      await bot.sendMessage(g.group_id, msg, { parse_mode: "MarkdownV2" });
+      await bot.sendMessage(g.group_id, msg);
     } catch (err) {
       console.error("[Alert] broadcast:", err.message);
     }
