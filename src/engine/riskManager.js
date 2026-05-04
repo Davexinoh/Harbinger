@@ -1,99 +1,150 @@
 import { getWalletAssets } from "../bayse/client.js";
 import { decrypt } from "../utils/encryption.js";
 
-const PLATFORM_FEE_PCT = parseFloat(process.env.PLATFORM_FEE_PCT || "0.03");
-const MAX_BALANCE_PCT = parseFloat(process.env.MAX_BALANCE_PCT || "0.60");
-const DAILY_LOSS_LIMIT = parseFloat(process.env.DAILY_LOSS_LIMIT || "0.20");
+const PLATFORM_FEE_PCT = Number(process.env.PLATFORM_FEE_PCT ?? 0.03);
+const MAX_BALANCE_PCT  = Number(process.env.MAX_BALANCE_PCT ?? 0.60);
+const DAILY_LOSS_LIMIT = Number(process.env.DAILY_LOSS_LIMIT ?? 0.30);
 
-const MIN_PRICE = 0.25;
-const MAX_PRICE = 0.75;
+const MIN_MARKET_PRICE = Number(process.env.MIN_MARKET_PRICE ?? 0.20);
+const MAX_MARKET_PRICE = Number(process.env.MAX_MARKET_PRICE ?? 0.80);
 
-const dailyRisk = new Map();
+const dailyLoss = new Map();
 
-function today() {
+function todayKey() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function getRisk(chatId, balance) {
-  const t = today();
-  let r = dailyRisk.get(chatId);
+function getOrCreateDaily(chatId, balance) {
+  const key = todayKey();
+  const existing = dailyLoss.get(chatId);
 
-  if (!r || r.date !== t) {
-    r = { date: t, loss: 0, startBalance: balance || 0 };
-    dailyRisk.set(chatId, r);
+  if (!existing || existing.date !== key) {
+    const fresh = {
+      date: key,
+      loss: 0,
+      startBalance: Number(balance || 0),
+    };
+    dailyLoss.set(chatId, fresh);
+    return fresh;
   }
 
-  return r;
+  return existing;
 }
 
 export function recordLoss(chatId, amount) {
-  const r = dailyRisk.get(chatId);
-  if (r && r.date === today()) {
-    r.loss += Math.abs(amount);
-  }
+  const rec = dailyLoss.get(chatId);
+  if (!rec || rec.date !== todayKey()) return;
+  rec.loss += Math.abs(Number(amount || 0));
 }
 
-async function getBalance(user) {
+export function recordWin(chatId, amount) {
+  const rec = dailyLoss.get(chatId);
+  if (!rec || rec.date !== todayKey()) return;
+  rec.loss = Math.max(0, rec.loss - Math.abs(Number(amount || 0)));
+}
+
+async function fetchBalance(user) {
   try {
     const pub = decrypt(user.bayse_pub_key);
     const sec = decrypt(user.bayse_sec_key);
 
     const assets = await getWalletAssets(pub, sec);
-    const list = assets?.assets || [];
 
-    const currency = user.currency || "USD";
+    const currency = (user.currency || "USD").toUpperCase();
+    const list = assets?.assets || assets?.data || assets || [];
+
+    if (!Array.isArray(list)) return null;
+
     const asset = list.find(a =>
-      (a.currency || "").toUpperCase() === currency.toUpperCase()
+      (a.currency || a.symbol || a.asset || "").toUpperCase() === currency
     );
 
-    return Number(asset?.available ?? asset?.balance ?? 0);
-  } catch {
+    const balance = Number(
+      asset?.available ?? asset?.balance ?? asset?.amount ?? 0
+    );
+
+    console.log(`[Risk] Balance ${user.chat_id}: ${currency} ${balance}`);
+    return Number.isFinite(balance) ? balance : null;
+  } catch (e) {
+    console.warn(`[Risk] balance fetch failed: ${e.message}`);
     return null;
   }
 }
 
+function getBtcFloor(threshold) {
+  return Math.max(threshold + 0.10, 0.60);
+}
+
 export async function checkRisk(user, match, decision, signals) {
-  const currency = user.currency || "USD";
+  const currency = (user.currency || "USD").toUpperCase();
   const minTrade = currency === "NGN" ? 100 : 1;
 
-  const price = decision.price ?? match.market?.outcome1Price ?? null;
+  const threshold = Number(user.threshold ?? 0.60);
 
-  if (typeof price !== "number" || price < MIN_PRICE || price > MAX_PRICE) {
-    return { allowed: false, reason: "Unsafe market price" };
-  }
+  // market sanity filter
+  const market = match?.market;
+  const yes = Number(market?.outcome1Price ?? 0.5);
+  const no  = Number(market?.outcome2Price ?? 0.5);
 
-  const balance = await getBalance(user);
+  const tradePrice = decision?.direction === "bullish" ? yes : no;
 
-  if (balance === null) {
-    return { allowed: false, reason: "Balance check failed" };
-  }
-
-  if (balance < minTrade) {
-    return { allowed: false, reason: "Insufficient balance" };
-  }
-
-  const risk = getRisk(user.chat_id, balance);
-  const lossLimit = risk.startBalance * DAILY_LOSS_LIMIT;
-
-  if (risk.loss >= lossLimit) {
+  if (tradePrice < MIN_MARKET_PRICE || tradePrice > MAX_MARKET_PRICE) {
     return {
       allowed: false,
-      reason: "Daily loss limit reached",
-      pauseEngine: true,
+      reason: `Market price ${(tradePrice * 100).toFixed(0)}¢ outside range`,
     };
   }
 
-  let amount = decision.amount;
+  // BTC gating
+  const title = (match?.event?.title || "").toLowerCase();
+  const isBtc = title.includes("btc") || title.includes("bitcoin");
 
-  const maxAllowed = balance * MAX_BALANCE_PCT;
-  if (amount > maxAllowed) {
-    amount = maxAllowed;
+  if (isBtc) {
+    const floor = getBtcFloor(threshold);
+    const btcScore = signals?.btc15m?.score ?? 0;
+
+    if (btcScore < floor) {
+      return {
+        allowed: false,
+        reason: `BTC score ${(btcScore * 100).toFixed(0)}% below floor ${(floor * 100).toFixed(0)}%`,
+      };
+    }
   }
 
-  amount =
-    currency === "NGN"
-      ? Math.max(Math.round(amount), 100)
-      : Math.max(amount, 1);
+  const balance = await fetchBalance(user);
+
+  if (balance !== null && balance < minTrade) {
+    return {
+      allowed: false,
+      reason: `Insufficient balance ${currency} ${balance}`,
+    };
+  }
+
+  // daily loss control
+  if (balance !== null) {
+    const rec = getOrCreateDaily(user.chat_id, balance);
+    const limit = rec.startBalance * DAILY_LOSS_LIMIT;
+
+    if (rec.loss >= limit) {
+      return {
+        allowed: false,
+        pauseEngine: true,
+        reason: `Daily loss limit hit ${rec.loss.toFixed(2)}`,
+      };
+    }
+  }
+
+  // cap exposure
+  let amount = Number(decision.amount || 0);
+
+  if (balance !== null) {
+    const maxAllowed = balance * MAX_BALANCE_PCT;
+    amount = Math.min(amount, maxAllowed);
+  }
+
+  amount = currency === "NGN"
+    ? Math.max(Math.round(amount), 100)
+    : Math.max(Number(amount.toFixed(2)), 1);
 
   return {
     allowed: true,
@@ -103,12 +154,22 @@ export async function checkRisk(user, match, decision, signals) {
 }
 
 export function calculateFee(pnl) {
-  if (pnl <= 0) return { userPnl: pnl, platformFee: 0 };
+  const p = Number(pnl || 0);
 
-  const fee = pnl * PLATFORM_FEE_PCT;
+  if (p <= 0) {
+    return { userPnl: p, platformFee: 0 };
+  }
+
+  const fee = Number((p * PLATFORM_FEE_PCT).toFixed(2));
 
   return {
-    userPnl: +(pnl - fee).toFixed(2),
-    platformFee: +fee.toFixed(2),
+    userPnl: Number((p - fee).toFixed(2)),
+    platformFee: fee,
   };
 }
+
+export {
+  PLATFORM_FEE_PCT,
+  MAX_BALANCE_PCT,
+  DAILY_LOSS_LIMIT,
+};
