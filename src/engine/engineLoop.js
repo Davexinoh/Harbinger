@@ -1,29 +1,50 @@
 import { runAllSignals, findMatchingMarket } from "./scorer.js";
-import { shouldTrade }                       from "./decisionGate.js";
-import { executeTrade }                      from "./executor.js";
-import { getActiveUsers, getUnsettledEventIds, getUser } from "../db/database.js";
-import { sendTradeAlert, broadcastToGroups } from "../bot/alerts.js";
-import { postCrowdPoll }                     from "../signals/crowdSignal.js";
-import { decrypt }                           from "../utils/encryption.js";
+import { shouldTrade } from "./decisionGate.js";
+import { executeTrade } from "./executor.js";
+import {
+  getActiveUsers,
+  getUnsettledEventIds,
+  getUser
+} from "../db/database.js";
+import { sendTradeAlert, broadcastSignals } from "../bot/alerts.js";
+import { decrypt } from "../utils/encryption.js";
 
-const TICK_MS          = parseInt(process.env.ENGINE_TICK_INTERVAL_MS) || 60_000;
-const WARMUP_THRESHOLD = parseFloat(process.env.SIGNAL_WARMUP_ALERT_THRESHOLD) || 0.55;
+const TICK_MS = 60_000;
 const MIN_TRADE_GAP_MS = 15 * 60 * 1000;
-const POLL_TICKS       = 5;
 
-let tickCount              = 0;
-const lastTradeTimes       = new Map();
-let crowdPollPosted        = false;
-let lastWasWarm            = false;
-let lastBroadcastScore     = 0;
-const BROADCAST_DELTA      = 0.08;
-let tickTimer              = null;
-let isRunning              = false;
+// --- Global guards ---
+let ticking = false;
+let isRunning = false;
+let tickTimer = null;
 
+// --- Per-user locks ---
+const userLocks = new Map();
+
+// --- Trade dedup ---
+const executedKeys = new Set();
+const EXEC_WINDOW = 60_000;
+
+function makeTradeKey(userId, eventId) {
+  const bucket = Math.floor(Date.now() / EXEC_WINDOW);
+  return `${userId}:${eventId}:${bucket}`;
+}
+
+function isDuplicateTrade(key) {
+  if (executedKeys.has(key)) return true;
+  executedKeys.add(key);
+  setTimeout(() => executedKeys.delete(key), EXEC_WINDOW);
+  return false;
+}
+
+// --- Cooldown ---
+const lastTradeTimes = new Map();
+
+// --- Engine control ---
 export function startEngine() {
   if (isRunning) return;
   isRunning = true;
-  console.log("[Engine] Starting Harbinger...");
+  console.log("[Engine] Started");
+
   tick();
   tickTimer = setInterval(tick, TICK_MS);
 }
@@ -33,99 +54,110 @@ export function stopEngine() {
   isRunning = false;
 }
 
+// --- Core loop ---
 async function tick() {
-  tickCount++;
-  const users = await getActiveUsers();
-  if (!users.length) return;
+  if (ticking) return;
+  ticking = true;
 
-  let signals;
   try {
-    signals = await runAllSignals();
-    console.log(`[Engine] tick#${tickCount} composite:${signals.composite.toFixed(2)} crypto:${signals.crypto.score.toFixed(2)} sports:${signals.sports.score.toFixed(2)} btc15m:${signals.btc15m?.score.toFixed(2)}`);
+    const users = await getActiveUsers();
+    if (!users.length) return;
+
+    const signals = await runAllSignals();
+    console.log(`[Engine] composite=${signals.composite.toFixed(2)}`);
+
+    // broadcast only on meaningful signals
+    if (signals.composite >= 0.60) {
+      await broadcastSignals(signals);
+    }
+
+    // compute shared market once
+    const pubKey = decrypt(users[0].bayse_pub_key);
+    const unsettled = await getUnsettledEventIds(users[0].chat_id);
+    const match = await findMatchingMarket(signals, pubKey, unsettled);
+
+    for (const user of users) {
+      processUserSafe(user, signals, match);
+    }
+
   } catch (err) {
-    console.error("[Engine] Signal run failed:", err.message);
-    return;
-  }
-
-  const isWarm = signals.composite >= WARMUP_THRESHOLD;
-  if (!isWarm && lastWasWarm) crowdPollPosted = false;
-  lastWasWarm = isWarm;
-
-  if (isWarm && !crowdPollPosted && users.length > 0) {
-    try {
-      const pubKey    = decrypt(users[0].bayse_pub_key);
-      const unsettled = await getUnsettledEventIds(users[0].chat_id);
-      const match     = await findMatchingMarket(signals, pubKey, unsettled);
-      await postCrowdPoll(signals, match);
-      crowdPollPosted = true;
-    } catch (err) { console.error("[Engine] Poll error:", err.message); }
-  }
-
-  if (tickCount % POLL_TICKS === 0 && isWarm) {
-    try { await broadcastToGroups(signals, true); } catch (_) {}
-  } else if (Math.abs(signals.composite - lastBroadcastScore) >= BROADCAST_DELTA) {
-    try { await broadcastToGroups(signals, false); lastBroadcastScore = signals.composite; } catch (_) {}
-  }
-
-  for (const user of users) {
-    try { await processUser(user, signals); }
-    catch (err) { console.error(`[Engine] User ${user.chat_id}:`, err.message); }
+    console.error("[Engine] Tick error:", err.message);
+  } finally {
+    ticking = false;
   }
 }
 
-async function processUser(user, signals) {
-  const chatId = user.chat_id;
+// --- Safe wrapper with lock ---
+async function processUserSafe(user, signals, match) {
+  const id = user.chat_id;
 
-  // Re-fetch user from DB to catch /stop that happened mid-tick
-  const fresh = await getUser(chatId);
-  if (!fresh?.engine_active) {
-    console.log(`[Engine] ${chatId} — engine stopped, skipping`);
-    return;
-  }
-
-  const decision = shouldTrade(signals, fresh);
-  if (!decision.fire) { console.log(`[Engine] ${chatId} — ${decision.reason}`); return; }
-
-  const lastTrade = lastTradeTimes.get(chatId) || 0;
-  const sinceMs   = Date.now() - lastTrade;
-  if (sinceMs < MIN_TRADE_GAP_MS) {
-    console.log(`[Engine] ${chatId} — cooldown: ${Math.ceil((MIN_TRADE_GAP_MS - sinceMs)/60000)}min`);
-    return;
-  }
-
-  const pubKey    = decrypt(fresh.bayse_pub_key);
-  const unsettled = await getUnsettledEventIds(chatId);
-  const match     = await findMatchingMarket(signals, pubKey, unsettled, fresh.preferred_category);
-  if (!match) { console.log(`[Engine] ${chatId} — no market`); return; }
-
-  // Amount calculation
-  // If user hasn't set up NGN properly, default max to ₦500 for NGN trades
-  const currency  = fresh.currency || "USD";
-  const maxAmount = parseFloat(fresh.max_trade_usd) || (currency === "NGN" ? 500 : 5);
-  const threshold = parseFloat(fresh.threshold) || 0.60;
-  const scale     = Math.min((signals.composite - threshold) / (0.95 - threshold), 1);
-  const rawAmount = maxAmount * 0.5 + maxAmount * 0.5 * scale;
-
-  // Always enforce Bayse minimums: ₦100 for NGN, $1 for USD
-  // If USD amount < $1, treat as NGN user and enforce ₦100
-  if (currency === "NGN" || rawAmount < 1) {
-    decision.amount = Math.max(Math.round(rawAmount), 100);
-  } else {
-    decision.amount = Math.max(parseFloat(rawAmount.toFixed(2)), 1);
-  }
+  if (userLocks.get(id)) return;
+  userLocks.set(id, true);
 
   try {
-    const result = await executeTrade(fresh, match, decision);
+    await processUser(user, signals, match);
+  } finally {
+    userLocks.delete(id);
+  }
+}
+
+// --- Per-user logic ---
+async function processUser(user, signals, match) {
+  const chatId = user.chat_id;
+
+  const fresh = await getUser(chatId);
+  if (!fresh?.engine_active) return;
+
+  const decision = shouldTrade(signals, fresh);
+  if (!decision.fire) return;
+
+  // cooldown
+  const last = lastTradeTimes.get(chatId) || 0;
+  if (Date.now() - last < MIN_TRADE_GAP_MS) return;
+
+  if (!match) return;
+
+  // idempotency
+  const key = makeTradeKey(chatId, match.event.id);
+  if (isDuplicateTrade(key)) return;
+
+  // amount calc (cleaned)
+  const currency = fresh.currency || "USD";
+  const max = parseFloat(fresh.max_trade_usd) || (currency === "NGN" ? 500 : 5);
+  const threshold = parseFloat(fresh.threshold) || 0.6;
+
+  const scale = Math.min((signals.composite - threshold) / (0.95 - threshold), 1);
+  let amount = max * (0.5 + 0.5 * scale);
+
+  if (currency === "NGN") {
+    amount = Math.max(Math.round(amount), 100);
+  } else {
+    amount = Math.max(parseFloat(amount.toFixed(2)), 1);
+  }
+
+  decision.amount = amount;
+
+  // FINAL lifecycle check (critical)
+  const latest = await getUser(chatId);
+  if (!latest?.engine_active) return;
+
+  try {
+    const result = await executeTrade(latest, match, decision);
+
     lastTradeTimes.set(chatId, Date.now());
-    console.log(`[Engine] ${chatId} ✓ "${match.event.title}"`);
-    await sendTradeAlert(chatId, result, signals, decision);
+
+    await sendTradeAlert(chatId, result, decision);
+
+    console.log(`[Engine] ${chatId} ✓ ${match.event.title}`);
   } catch (err) {
-    console.error(`[Engine] ${chatId} failed: ${err.message}`);
     lastTradeTimes.set(chatId, Date.now());
-    await sendTradeAlert(chatId, null, signals, decision, err.message);
+
+    await sendTradeAlert(chatId, null, decision, err.message);
+
+    console.error(`[Engine] ${chatId} failed:`, err.message);
   }
 }
 
 export function getEngineStatus() {
-  return { running: isRunning, tickIntervalMs: TICK_MS, activeUsers: 0 };
+  return { running: isRunning };
 }
