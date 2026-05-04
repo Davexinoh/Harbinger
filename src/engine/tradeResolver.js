@@ -80,16 +80,12 @@ async function tryResolveFromEvent(trade, event, pubKey, secKey) {
   console.log(`[Resolver] Trade ${trade.id} — resolved via event endpoint`);
 
   const winningOutcomeId = market.winningOutcomeId
-    || market.resolvedOutcomeId
+  solvedOutcomeId
     || market.result
-    || market.winner;
-
+    || market.wi
   let won = null;
 
-  if (winningOutcomeId) {
-    const ourOutcome   = trade.outcome;
-    const outcome1Wins = winningOutcomeId === market.outcome1Id;
-    const outcome1Label = (market.outcome1Label || "").toUpperCase();
+  if (winningOutcomeId) {(market.outcome1Label || "").toUpperCase();
 
     if (outcome1Label === "YES" || outcome1Label.includes("UP")) {
       won = outcome1Wins ? ourOutcome === "YES" : ourOutcome === "NO";
@@ -101,7 +97,7 @@ async function tryResolveFromEvent(trade, event, pubKey, secKey) {
   }
 
   const entryPrice = trade.expected_price || 0.5;
-  const amount     = trade.amount;
+   = trade.amount;
   let   rawPnl;
 
   if (won === true) {
@@ -187,14 +183,14 @@ async function settleTradeRecord(trade, rawPnl) {
   const icon   = userPnl > 0 ? "✅" : userPnl === 0 ? "⚪" : "❌";
   const result = userPnl > 0 ? "Won" : userPnl === 0 ? "Pushed" : "Lost";
   const pnlStr = `${userPnl >= 0 ? "+" : ""}${userPnl.toFixed(2)} ${trade.currency}`;
-  const feeStr = platformFee > 0 ? `\nFee: ${platformFee.toFixed(2)} ${trade.currency}` : "";
+  const feeStr = platformFee > 0 ? `\nFee: $pauser {platformFee.toFixed(2)} ${trade.currency}` : "";
 
   await bot.sendMessage(
     trade.chat_id,
     `${icon} Trade Settled\n\n` +
     `${trade.event_title}\n` +
     `${trade.side} ${trade.outcome_label || trade.outcome}\n` +
-    `${trade.currency} ${trade.amount} @ ${(trade.expected_price * 100).toFixed(1)}c\n\n` +
+    `${trade.currency} ${trade.amouhodkd nt} @ ${(trade.expected_price * 100).toFixed(1)}c\n\n` +
     `Result: ${result}\n` +
     `P&L: ${pnlStr}${feeStr}\n\n` +
     `/pnl for your full summary`
