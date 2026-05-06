@@ -1,7 +1,7 @@
-import { getOpenTrades, updateTrade } from "../db/database.js";
-import { getPortfolio, getEventById } from "../bayse/client.js";
-import { decrypt }                    from "../utils/encryption.js";
-import { calculateFee, recordLoss, recordWin } from "./riskManager.js";
+import { getOpenTrades, updateTrade, getPool } from "../db/database.js";
+import { getPortfolio, getEventById }           from "../bayse/client.js";
+import { decrypt }                              from "../utils/encryption.js";
+import { calculateFee, recordLoss, recordWin }  from "./riskManager.js";
 
 let bot           = null;
 let resolverTimer = null;
@@ -11,11 +11,30 @@ export function setResolverBot(botInstance) { bot = botInstance; }
 export function startTradeResolver() {
   resolverTimer = setInterval(resolveOpenTrades, 2 * 60 * 1000);
   console.log("[Resolver] Started — checking every 2 min");
-  setTimeout(resolveOpenTrades, 20_000);
+  // Stale cleanup runs once on boot, then resolver starts
+  setTimeout(async () => {
+    await cleanupStaleTrades();
+    resolveOpenTrades();
+  }, 20_000);
 }
 
 export function stopTradeResolver() {
   if (resolverTimer) clearInterval(resolverTimer);
+}
+
+async function cleanupStaleTrades() {
+  try {
+    const res = await getPool().query(`
+      UPDATE trades SET status = 'stale', resolved_at = NOW()
+      WHERE status = 'open'
+        AND executed_at < NOW() - INTERVAL '7 days'
+    `);
+    if (res.rowCount > 0) {
+      console.log(`[Resolver] Marked ${res.rowCount} stale trades as closed`);
+    }
+  } catch (err) {
+    console.error("[Resolver] Stale cleanup error:", err.message);
+  }
 }
 
 async function resolveOpenTrades() {
@@ -41,6 +60,7 @@ async function resolveSingleTrade(trade) {
   const pubKey = decrypt(trade.bayse_pub_key);
   const secKey = decrypt(trade.bayse_sec_key);
 
+  // Method 1: event endpoint
   try {
     const event    = await getEventById(pubKey, trade.event_id);
     const resolved = await tryResolveFromEvent(trade, event);
@@ -49,6 +69,7 @@ async function resolveSingleTrade(trade) {
     console.log(`[Resolver] Event fetch failed for trade ${trade.id}: ${err.message}`);
   }
 
+  // Method 2: portfolio (outcomeBalances)
   try {
     await tryResolveFromPortfolio(trade, pubKey, secKey);
   } catch (err) {
@@ -110,16 +131,11 @@ async function tryResolveFromEvent(trade, event) {
   return true;
 }
 
-// Bayse portfolio shape: { outcomeBalances: [...] }
-// Each entry: { cost, currentValue, currency, market: { id, event: { id, status } } }
 async function tryResolveFromPortfolio(trade, pubKey, secKey) {
   const portfolio = await getPortfolio(pubKey, secKey);
   const balances  = portfolio?.outcomeBalances;
 
-  if (!Array.isArray(balances)) {
-    console.log(`[Resolver] Trade ${trade.id} — unexpected portfolio shape:`, Object.keys(portfolio || {}));
-    return;
-  }
+  if (!Array.isArray(balances)) return;
 
   const entry = balances.find(b =>
     b.market?.id        === trade.market_id ||
@@ -149,7 +165,9 @@ async function tryResolveFromPortfolio(trade, pubKey, secKey) {
 }
 
 async function settleTradeRecord(trade, rawPnl) {
-  const { userPnl, platformFee } = calculateFee(rawPnl);
+  const won = rawPnl > 0;
+  // No platform fee — simplified
+  const userPnl = parseFloat(rawPnl.toFixed(2));
 
   await updateTrade(trade.id, {
     status:      "resolved",
@@ -160,26 +178,22 @@ async function settleTradeRecord(trade, rawPnl) {
   if (userPnl > 0) recordWin(trade.chat_id,  userPnl);
   else              recordLoss(trade.chat_id, Math.abs(userPnl));
 
-  console.log(
-    `[Resolver] Trade ${trade.id} settled | ` +
-    `raw:${rawPnl} fee:${platformFee} user:${userPnl} ${trade.currency}`
-  );
+  console.log(`[Resolver] Trade ${trade.id} settled | pnl:${userPnl} ${trade.currency}`);
 
   if (!bot) return;
 
   const icon   = userPnl > 0 ? "✅" : userPnl === 0 ? "⚪" : "❌";
   const result = userPnl > 0 ? "Won" : userPnl === 0 ? "Pushed" : "Lost";
   const pnlStr = `${userPnl >= 0 ? "+" : ""}${userPnl.toFixed(2)} ${trade.currency}`;
-  const feeStr = platformFee > 0 ? `\nFee: ${platformFee.toFixed(2)} ${trade.currency}` : "";
 
   await bot.sendMessage(
     trade.chat_id,
     `${icon} Trade Settled\n\n` +
     `${trade.event_title}\n` +
     `${trade.side} ${trade.outcome_label || trade.outcome}\n` +
-    `${trade.currency} ${trade.amount} @ ${(trade.expected_price * 100).toFixed(1)}c\n\n` +
+    `${trade.currency} ${trade.amount} @ ${((trade.expected_price || 0.5) * 100).toFixed(1)}c\n\n` +
     `Result: ${result}\n` +
-    `P&L: ${pnlStr}${feeStr}\n\n` +
+    `P&L: ${pnlStr}\n\n` +
     `/pnl for your full summary`
   ).catch(err => console.error(`[Resolver] Notify failed:`, err.message));
 }
