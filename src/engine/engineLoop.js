@@ -1,29 +1,21 @@
 import { runAllSignals, findMatchingMarket } from "./scorer.js";
-import { shouldTrade } from "./decisionGate.js";
-import { executeTrade } from "./executor.js";
-import {
-  getActiveUsers,
-  getUnsettledEventIds,
-  getUser
-} from "../db/database.js";
+import { shouldTrade }    from "./decisionGate.js";
+import { executeTrade }   from "./executor.js";
+import { getActiveUsers, getUnsettledEventIds, getUser } from "../db/database.js";
 import { sendTradeAlert, broadcastSignals } from "../bot/alerts.js";
-import { decrypt } from "../utils/encryption.js";
 
-const TICK_MS = 60_000;
+const TICK_MS          = 60_000;
 const MIN_TRADE_GAP_MS = 15 * 60 * 1000;
 
-// --- Global guards ---
-let ticking   = false;
-let isRunning = false;
-let tickTimer = null;
+let ticking         = false;
+let isRunning       = false;
+let tickTimer       = null;
 let activeUserCount = 0;
 
-// --- Per-user locks ---
-const userLocks = new Map();
-
-// --- Trade dedup ---
-const executedKeys = new Set();
-const EXEC_WINDOW  = 60_000;
+const userLocks      = new Map();
+const lastTradeTimes = new Map();
+const executedKeys   = new Set();
+const EXEC_WINDOW    = 60_000;
 
 function makeTradeKey(userId, eventId) {
   const bucket = Math.floor(Date.now() / EXEC_WINDOW);
@@ -37,10 +29,6 @@ function isDuplicateTrade(key) {
   return false;
 }
 
-// --- Cooldown ---
-const lastTradeTimes = new Map();
-
-// --- Engine control ---
 export function startEngine() {
   if (isRunning) return;
   isRunning = true;
@@ -54,7 +42,6 @@ export function stopEngine() {
   isRunning = false;
 }
 
-// --- Core loop ---
 async function tick() {
   if (ticking) return;
   ticking = true;
@@ -68,15 +55,15 @@ async function tick() {
     console.log(`[Engine] composite=${signals.composite.toFixed(2)}`);
 
     if (signals.composite >= 0.60) {
-      await broadcastSignals(signals);
+      await broadcastSignals(signals).catch(() => {});
     }
 
-    const pubKey   = decrypt(users[0].bayse_pub_key);
+    // Use first user's key to fetch markets — all users share same Bayse market pool
+    const pubKey    = Buffer.from(users[0].bayse_pub_key, "base64").toString("utf8");
     const unsettled = await getUnsettledEventIds(users[0].chat_id);
-    const match    = await findMatchingMarket(signals, pubKey, unsettled);
 
     for (const user of users) {
-      processUserSafe(user, signals, match);
+      processUserSafe(user, signals, pubKey, unsettled);
     }
 
   } catch (err) {
@@ -86,20 +73,18 @@ async function tick() {
   }
 }
 
-// --- Safe wrapper with lock ---
-async function processUserSafe(user, signals, match) {
+async function processUserSafe(user, signals, pubKey, unsettled) {
   const id = user.chat_id;
   if (userLocks.get(id)) return;
   userLocks.set(id, true);
   try {
-    await processUser(user, signals, match);
+    await processUser(user, signals, pubKey, unsettled);
   } finally {
     userLocks.delete(id);
   }
 }
 
-// --- Per-user logic ---
-async function processUser(user, signals, match) {
+async function processUser(user, signals, pubKey, unsettled) {
   const chatId = user.chat_id;
 
   const fresh = await getUser(chatId);
@@ -111,28 +96,28 @@ async function processUser(user, signals, match) {
   const last = lastTradeTimes.get(chatId) || 0;
   if (Date.now() - last < MIN_TRADE_GAP_MS) return;
 
+  // Pass user's preferred category to market finder — THIS was missing
+  const preferred = fresh.preferred_category && fresh.preferred_category !== "all"
+    ? fresh.preferred_category
+    : null;
+
+  const match = await findMatchingMarket(signals, pubKey, unsettled, preferred);
   if (!match) return;
 
   const key = makeTradeKey(chatId, match.event.id);
   if (isDuplicateTrade(key)) return;
 
-  // FIX: was reading max_trade_usd (undefined) — correct column is max_trade_amount
-  const currency  = fresh.currency || "USD";
-  const max       = parseFloat(fresh.max_trade_amount) || (currency === "NGN" ? 500 : 5);
+  const currency = fresh.currency || "USD";
+  const max      = parseFloat(fresh.max_trade_amount) || (currency === "NGN" ? 500 : 5);
   const threshold = parseFloat(fresh.threshold) || 0.6;
+  const scale    = Math.min((signals.composite - threshold) / (0.95 - threshold), 1);
 
-  const scale = Math.min((signals.composite - threshold) / (0.95 - threshold), 1);
   let amount = max * (0.5 + 0.5 * scale);
-
-  if (currency === "NGN") {
-    amount = Math.max(Math.round(amount), 100);
-  } else {
-    amount = Math.max(parseFloat(amount.toFixed(2)), 1);
-  }
+  if (currency === "NGN") amount = Math.max(Math.round(amount), 100);
+  else                    amount = Math.max(parseFloat(amount.toFixed(2)), 1);
 
   decision.amount = amount;
 
-  // Final lifecycle check
   const latest = await getUser(chatId);
   if (!latest?.engine_active) return;
 
@@ -149,8 +134,5 @@ async function processUser(user, signals, match) {
 }
 
 export function getEngineStatus() {
-  return {
-    running:     isRunning,
-    activeUsers: activeUserCount,
-  };
+  return { running: isRunning, activeUsers: activeUserCount };
 }
