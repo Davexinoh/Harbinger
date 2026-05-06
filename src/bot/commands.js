@@ -1,477 +1,251 @@
-import {
-  upsertUser,
-  getUser,
-  updateUser,
-  upsertGroup,
-  getRecentTrades,
-  getPnL,
-  getLeaderboard,
-} from "../db/database.js";
-
 import { encrypt, decrypt } from "../utils/encryption.js";
-import { validateKeys, getEvents } from "../bayse/client.js";
-import { runAllSignals } from "../engine/scorer.js";
-import { getEngineStatus } from "../engine/engineLoop.js";
+import { validateKeys }     from "../bayse/client.js";
+import { runAllSignals }    from "../signals/index.js";
+import {
+  upsertUser, getUser, updateUser,
+  getRecentTrades, getPnL,
+} from "../db/database.js";
+import { getEngineStatus }  from "../engine/engineLoop.js";
+import { sendAlert }        from "./alerts.js";
 
-const SETUP = {
-  PUB:      "pub",
-  SEC:      "sec",
-  THRESHOLD:"threshold",
-  LIMIT:    "limit",
-  CURRENCY: "currency",
-  CATEGORY: "category",
+const CATEGORIES = ["sports", "crypto", "politics", "entertainment", "finance", "all"];
+
+const STEP = {
+  PUB:       "pub",
+  SEC:       "sec",
+  THRESHOLD: "threshold",
+  LIMIT:     "limit",
+  CATEGORY:  "category",
 };
 
-const VALID_CATEGORIES = ["sports", "crypto", "politics", "entertainment", "finance", "all"];
-
-function bar(score) {
-  const filled = Math.round(score * 10);
-  return "█".repeat(filled) + "░".repeat(10 - filled) + ` ${(score * 100).toFixed(0)}%`;
-}
-
-function esc(text) {
-  return String(text).replace(/[_*[\]()~`>#+=|{}.!\\-]/g, "\\$&");
+function bar(score = 0.5) {
+  const f = Math.round(Math.max(0, Math.min(1, score)) * 10);
+  return "█".repeat(f) + "░".repeat(10 - f) + ` ${(score * 100).toFixed(0)}%`;
 }
 
 export function registerCommands(bot) {
 
-  // ───────────────────────── START ─────────────────────────
-  bot.onText(/\/start/, async (msg) => {
+  // /start
+  bot.onText(/\/start/, async msg => {
     const chatId = msg.chat.id;
-    const isGroup = ["group", "supergroup"].includes(msg.chat.type);
-
-    if (isGroup) {
-      await upsertGroup(chatId, msg.chat.title, msg.from?.id);
-      return bot.sendMessage(chatId,
-        `📡 Bot active.\nSignals + crowd tracking enabled.\nUse DM for trading engine.`
-      );
-    }
-
     await upsertUser(chatId, msg.from?.username);
     const user = await getUser(chatId);
-    const hasKeys = user?.bayse_pub_key && user?.bayse_sec_key;
-
+    const connected = user?.bayse_pub_key;
     return bot.sendMessage(chatId,
-      `Harbinger Engine\n\nSignal-driven prediction system.\n\n` +
-      (hasKeys
-        ? `Ready:\n /run — start engine\n /signals — live state\n /trades — history`
-        : `Setup required:\n /connect — API keys\n /setup — configure engine\n /run — start`) +
-      `\n\n /status — engine status\n /pnl — performance\n /markets — browse\n /category — set market type`
+      `Harbinger\nSignal-driven prediction engine\n\n` +
+      (connected
+        ? `/run — start\n/signals — live signals\n/status — engine status\n/trades — history\n/pnl — performance`
+        : `/connect — add Bayse API keys\n/setup — configure engine`)
     );
   });
 
-  // ───────────────────────── CONNECT ─────────────────────────
-  bot.onText(/\/connect/, async (msg) => {
-    const chatId = msg.chat.id;
-    await updateUser(chatId, { setup_step: SETUP.PUB });
-    return bot.sendMessage(chatId, `Send your Bayse PUBLIC key (pk_...)`);
+  // /connect
+  bot.onText(/\/connect/, async msg => {
+    await updateUser(msg.chat.id, { setup_step: STEP.PUB });
+    return bot.sendMessage(msg.chat.id, "Send your Bayse PUBLIC key (starts with pk_):");
   });
 
-  // ───────────────────────── DISCONNECT ─────────────────────────
-  bot.onText(/\/disconnect/, async (msg) => {
-    const chatId = msg.chat.id;
-    await updateUser(chatId, {
-      bayse_pub_key: null,
-      bayse_sec_key: null,
-      engine_active: 0,
-      setup_step: null,
+  // /disconnect
+  bot.onText(/\/disconnect/, async msg => {
+    await updateUser(msg.chat.id, {
+      bayse_pub_key: null, bayse_sec_key: null,
+      engine_active: 0, setup_step: null,
     });
-    return bot.sendMessage(chatId, `Keys removed. Engine stopped.\n\n/connect to reconnect.`);
+    return bot.sendMessage(msg.chat.id, "Keys removed. Engine stopped.");
   });
 
-  // ───────────────────────── SETUP ─────────────────────────
-  bot.onText(/\/setup/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-
-    if (!user?.bayse_pub_key) {
-      return bot.sendMessage(chatId, `Connect keys first with /connect`);
-    }
-
-    await updateUser(chatId, { setup_step: SETUP.THRESHOLD });
-    return bot.sendMessage(chatId,
-      `Threshold (0.5–0.95)\nCurrent: ${user.threshold || 0.6}\n\nSend a number:`
+  // /setup
+  bot.onText(/\/setup/, async msg => {
+    const user = await getUser(msg.chat.id);
+    if (!user?.bayse_pub_key) return bot.sendMessage(msg.chat.id, "Connect keys first with /connect");
+    await updateUser(msg.chat.id, { setup_step: STEP.THRESHOLD });
+    return bot.sendMessage(msg.chat.id,
+      `Set confidence threshold (0.50–0.95)\nCurrent: ${user.threshold}\n\nSend a number:`
     );
   });
 
-  // ───────────────────────── RUN ─────────────────────────
-  bot.onText(/\/run/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-
-    if (!user?.bayse_pub_key || !user?.bayse_sec_key) {
-      return bot.sendMessage(chatId, `Missing keys. Run /connect first.`);
-    }
-
-    await updateUser(chatId, { engine_active: 1, setup_step: null });
-    return bot.sendMessage(chatId, `✅ Engine started.\n\n/pause to pause | /stop to stop`);
+  // /run
+  bot.onText(/\/run/, async msg => {
+    const user = await getUser(msg.chat.id);
+    if (!user?.bayse_pub_key || !user?.bayse_sec_key)
+      return bot.sendMessage(msg.chat.id, "Connect keys first with /connect");
+    await updateUser(msg.chat.id, { engine_active: 1, setup_step: null });
+    return bot.sendMessage(msg.chat.id, "Engine started.\n\n/pause to pause | /stop to stop");
   });
 
-  // ───────────────────────── PAUSE ─────────────────────────
-  bot.onText(/\/pause/, async (msg) => {
+  // /pause
+  bot.onText(/\/pause/, async msg => {
     await updateUser(msg.chat.id, { engine_active: 0 });
-    return bot.sendMessage(msg.chat.id, `⏸ Engine paused.\n\n/resume to continue`);
+    return bot.sendMessage(msg.chat.id, "Engine paused.\n\n/resume to continue");
   });
 
-  // ───────────────────────── RESUME ─────────────────────────
-  bot.onText(/\/resume/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-
-    if (!user?.bayse_pub_key || !user?.bayse_sec_key) {
-      return bot.sendMessage(chatId, `No keys connected. Run /connect first.`);
-    }
-
-    await updateUser(chatId, { engine_active: 1 });
-    return bot.sendMessage(chatId, `▶️ Engine resumed.`);
+  // /resume
+  bot.onText(/\/resume/, async msg => {
+    const user = await getUser(msg.chat.id);
+    if (!user?.bayse_pub_key) return bot.sendMessage(msg.chat.id, "Connect keys first.");
+    await updateUser(msg.chat.id, { engine_active: 1 });
+    return bot.sendMessage(msg.chat.id, "Engine resumed.");
   });
 
-  // ───────────────────────── STOP ─────────────────────────
-  bot.onText(/\/stop/, async (msg) => {
+  // /stop
+  bot.onText(/\/stop/, async msg => {
     await updateUser(msg.chat.id, { engine_active: 0, setup_step: null });
-    return bot.sendMessage(msg.chat.id, `⏹ Engine stopped.\n\n/run to restart`);
+    return bot.sendMessage(msg.chat.id, "Engine stopped.\n\n/run to restart");
   });
 
-  // ───────────────────────── STATUS ─────────────────────────
-  bot.onText(/\/status/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-    const engine = getEngineStatus();
-
-    const cat = user?.preferred_category || "all";
-    const currency = user?.currency || "USD";
-
-    return bot.sendMessage(chatId,
+  // /status
+  bot.onText(/\/status/, async msg => {
+    const user   = await getUser(msg.chat.id);
+    const status = getEngineStatus();
+    return bot.sendMessage(msg.chat.id,
       `Status\n\n` +
-      `Engine: ${user?.engine_active ? "ON ▶️" : "OFF ⏹"}\n` +
+      `Engine: ${user?.engine_active ? "ON" : "OFF"}\n` +
       `Threshold: ${user?.threshold || 0.6}\n` +
-      `Max trade: ${currency} ${user?.max_trade_amount || "—"}\n` +
-      `Category: ${cat}\n` +
-      `Currency: ${currency}\n` +
-      `Active users: ${engine.activeUsers}`
+      `Max trade: NGN ${user?.max_trade_amount || 200}\n` +
+      `Category: ${user?.preferred_category || "all"}\n` +
+      `Active users: ${status.activeUsers}`
     );
   });
 
-  // ───────────────────────── SIGNALS ─────────────────────────
-  bot.onText(/\/signals/, async (msg) => {
-    const chatId = msg.chat.id;
-
-    await bot.sendMessage(chatId, `Fetching signals...`);
-
+  // /signals
+  bot.onText(/\/signals/, async msg => {
+    await bot.sendMessage(msg.chat.id, "Fetching signals...");
     try {
-      const signals = await runAllSignals();
-
-      return bot.sendMessage(chatId,
+      const user    = await getUser(msg.chat.id);
+      const pubKey  = user?.bayse_pub_key ? decrypt(user.bayse_pub_key) : null;
+      const signals = await runAllSignals(pubKey);
+      return bot.sendMessage(msg.chat.id,
         `Signal Report\n\n` +
-        `BTC 15m  ${bar(signals.btc15m?.score ?? 0.5)}\n` +
-        `Crypto   ${bar(signals.crypto?.score ?? 0.5)}\n` +
-        `Sports   ${bar(signals.sports?.score ?? 0.5)}\n` +
-        `Sentiment ${bar(signals.sentiment?.score ?? 0.5)}`
+        `Crypto    ${bar(signals.crypto.score)}  ${signals.crypto.direction || ""}\n` +
+        `BTC 15m   ${bar(signals.btc15m.score)}  ${signals.btc15m.direction || ""}\n` +
+        `Sentiment ${bar(signals.sentiment.score)}\n` +
+        `Sports    ${bar(signals.sports.score)}\n\n` +
+        `Composite ${bar(signals.composite)}`
       );
     } catch (err) {
-      return bot.sendMessage(chatId, `Failed to fetch signals: ${err.message}`);
+      return bot.sendMessage(msg.chat.id, `Signal fetch failed: ${err.message}`);
     }
   });
 
-  // ───────────────────────── TRADES ─────────────────────────
-  bot.onText(/\/trades/, async (msg) => {
-    const chatId = msg.chat.id;
-
-    try {
-      const trades = await getRecentTrades(String(chatId), 10);
-
-      if (!trades?.length) {
-        return bot.sendMessage(chatId, `No trades yet.\n\n/run to start the engine.`);
-      }
-
-      const lines = trades.map((t, i) => {
-        const status = t.status === "won" ? "✅" : t.status === "lost" ? "❌" : "⏳";
-        const pnl = t.pnl != null ? ` | ${t.pnl > 0 ? "+" : ""}${t.pnl}` : "";
-        return `${i + 1}. ${status} ${esc(t.event_title?.slice(0, 35))}\n   ${t.side} ${t.amount} ${t.currency}${pnl}`;
-      });
-
-      return bot.sendMessage(chatId,
-        `Recent Trades\n\n${lines.join("\n\n")}\n\n/pnl for performance summary`
-      );
-    } catch (err) {
-      return bot.sendMessage(chatId, `Error fetching trades: ${err.message}`);
-    }
-  });
-
-  // ───────────────────────── PNL ─────────────────────────
-  bot.onText(/\/pnl/, async (msg) => {
-    const chatId = msg.chat.id;
-
-    try {
-      const pnl = await getPnL(String(chatId));
-
-      if (!pnl) {
-        return bot.sendMessage(chatId, `No trade data yet.`);
-      }
-
-      const winRate = pnl.total > 0
-        ? ((pnl.wins / pnl.total) * 100).toFixed(1)
-        : "0.0";
-
-      return bot.sendMessage(chatId,
-        `Performance\n\n` +
-        `Total trades: ${pnl.total || 0}\n` +
-        `Wins: ${pnl.wins || 0} | Losses: ${pnl.losses || 0}\n` +
-        `Win rate: ${winRate}%\n` +
-        `Net P&L: ${pnl.net > 0 ? "+" : ""}${(pnl.net || 0).toFixed(2)} ${pnl.currency || "USD"}`
-      );
-    } catch (err) {
-      return bot.sendMessage(chatId, `Error fetching P&L: ${err.message}`);
-    }
-  });
-
-  // ───────────────────────── THRESHOLD ─────────────────────────
-  bot.onText(/\/threshold/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-
-    await updateUser(chatId, { setup_step: SETUP.THRESHOLD });
-    return bot.sendMessage(chatId,
-      `Set confidence threshold (0.5–0.95)\nCurrent: ${user?.threshold || 0.6}\n\nSend a number:`
+  // /category
+  bot.onText(/\/category/, async msg => {
+    const user = await getUser(msg.chat.id);
+    await updateUser(msg.chat.id, { setup_step: STEP.CATEGORY });
+    return bot.sendMessage(msg.chat.id,
+      `Set market category\nCurrent: ${user?.preferred_category || "all"}\n\n` +
+      CATEGORIES.map((c, i) => `${i + 1}. ${c}`).join("\n") +
+      `\n\nSend category name:`
     );
   });
 
-  // ───────────────────────── LIMIT ─────────────────────────
-  bot.onText(/\/limit/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-    const currency = user?.currency || "USD";
-
-    await updateUser(chatId, { setup_step: SETUP.LIMIT });
-    return bot.sendMessage(chatId,
-      `Set max trade amount (${currency})\nCurrent: ${user?.max_trade_amount || "—"}\n\nSend a number:`
-    );
-  });
-
-  // ───────────────────────── CATEGORY ─────────────────────────
-  bot.onText(/\/category/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-    const current = user?.preferred_category || "all";
-
-    await updateUser(chatId, { setup_step: SETUP.CATEGORY });
-
-    return bot.sendMessage(chatId,
-      `Set market category\nCurrent: ${current}\n\n` +
-      `Options:\n` +
-      VALID_CATEGORIES.map((c, i) => `${i + 1}. ${c}`).join("\n") +
-      `\n\nSend the category name:`
-    );
-  });
-
-  // ───────────────────────── MARKETS ─────────────────────────
-  bot.onText(/\/markets/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-
-    await bot.sendMessage(chatId, `Fetching open markets...`);
-
+  // /markets
+  bot.onText(/\/markets/, async msg => {
+    const user = await getUser(msg.chat.id);
+    await bot.sendMessage(msg.chat.id, "Fetching open markets...");
     try {
       const pubKey = user?.bayse_pub_key ? decrypt(user.bayse_pub_key) : null;
-      const category = user?.preferred_category !== "all" ? user?.preferred_category : undefined;
-      const events = await getEvents(pubKey, { status: "open", size: 10, category });
-
-      if (!events?.length) {
-        return bot.sendMessage(chatId, `No open markets found.`);
-      }
-
-      const lines = events.slice(0, 8).map((e, i) => {
-        const market = e.markets?.find(m => m.status === "open");
-        const yes = market?.outcome1Price != null
-          ? `${(market.outcome1Price * 100).toFixed(0)}¢`
-          : "—";
-        const no = market?.outcome2Price != null
-          ? `${(market.outcome2Price * 100).toFixed(0)}¢`
-          : "—";
-        return `${i + 1}. ${esc(e.title?.slice(0, 45))}\n   YES ${yes} | NO ${no}`;
+      const res    = await fetch(`https://relay.bayse.markets/v1/pm/events?status=open&size=8&currency=NGN`, {
+        headers: pubKey ? { "X-Public-Key": pubKey } : {},
       });
-
-      return bot.sendMessage(chatId,
-        `Open Markets\n\n${lines.join("\n\n")}\n\n/hot for most active`
-      );
+      const data   = await res.json();
+      const events = data?.events || [];
+      if (!events.length) return bot.sendMessage(msg.chat.id, "No open markets right now.");
+      const lines  = events.map((e, i) => {
+        const m = e.markets?.find(mk => mk.status === "open");
+        return `${i + 1}. ${e.title.slice(0, 45)}\n   YES ${m ? (m.outcome1Price * 100).toFixed(0) + "¢" : "—"} | ${e.engine}`;
+      });
+      return bot.sendMessage(msg.chat.id, `Open Markets\n\n${lines.join("\n\n")}`);
     } catch (err) {
-      return bot.sendMessage(chatId, `Error fetching markets: ${err.message}`);
+      return bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
     }
   });
 
-  // ───────────────────────── HOT ─────────────────────────
-  bot.onText(/\/hot/, async (msg) => {
-    const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-
-    await bot.sendMessage(chatId, `Finding hottest markets...`);
-
-    try {
-      const pubKey = user?.bayse_pub_key ? decrypt(user.bayse_pub_key) : null;
-      const events = await getEvents(pubKey, { status: "open", size: 50 });
-
-      if (!events?.length) {
-        return bot.sendMessage(chatId, `No open markets found.`);
-      }
-
-      // Sort by total order volume as proxy for activity
-      const sorted = events
-        .filter(e => e.markets?.some(m => m.status === "open"))
-        .sort((a, b) => (b.totalOrders || 0) - (a.totalOrders || 0))
-        .slice(0, 6);
-
-      const lines = sorted.map((e, i) => {
-        const market = e.markets?.find(m => m.status === "open");
-        const yes = market?.outcome1Price != null
-          ? `${(market.outcome1Price * 100).toFixed(0)}¢`
-          : "—";
-        const no = market?.outcome2Price != null
-          ? `${(market.outcome2Price * 100).toFixed(0)}¢`
-          : "—";
-        const orders = e.totalOrders || 0;
-        return `${i + 1}. ${esc(e.title?.slice(0, 45))}\n   YES ${yes} | NO ${no} | ${orders} orders`;
-      });
-
-      return bot.sendMessage(chatId, `Hottest Markets\n\n${lines.join("\n\n")}`);
-    } catch (err) {
-      return bot.sendMessage(chatId, `Error: ${err.message}`);
-    }
+  // /trades
+  bot.onText(/\/trades/, async msg => {
+    const trades = await getRecentTrades(String(msg.chat.id), 8);
+    if (!trades.length) return bot.sendMessage(msg.chat.id, "No trades yet. Run /run to start.");
+    const lines = trades.map((t, i) => {
+      const icon = t.status === "resolved" ? (t.pnl > 0 ? "✅" : "❌") : "⏳";
+      const pnl  = t.pnl != null ? ` | ${t.pnl > 0 ? "+" : ""}${t.pnl.toFixed(0)}` : "";
+      return `${i + 1}. ${icon} ${t.event_title.slice(0, 35)}\n   ${t.outcome} ₦${t.amount}${pnl}`;
+    });
+    return bot.sendMessage(msg.chat.id, `Recent Trades\n\n${lines.join("\n\n")}`);
   });
 
-  // ───────────────────────── LEADERBOARD ─────────────────────────
-  bot.onText(/\/leaderboard/, async (msg) => {
-    const chatId = msg.chat.id;
-
-    try {
-      const board = await getLeaderboard(10);
-
-      if (!board?.length) {
-        return bot.sendMessage(chatId, `No leaderboard data yet.`);
-      }
-
-      const lines = board.map((entry, i) => {
-        const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`;
-        const winRate = entry.total > 0
-          ? ((entry.wins / entry.total) * 100).toFixed(1)
-          : "0.0";
-        const name = entry.username ? `@${esc(entry.username)}` : `User ${String(entry.chat_id).slice(-4)}`;
-        return `${medal} ${name}\n   ${winRate}% win rate | ${entry.total} trades`;
-      });
-
-      return bot.sendMessage(chatId, `Leaderboard\n\n${lines.join("\n\n")}`);
-    } catch (err) {
-      return bot.sendMessage(chatId, `Error: ${err.message}`);
-    }
+  // /pnl
+  bot.onText(/\/pnl/, async msg => {
+    const pnl = await getPnL(String(msg.chat.id));
+    if (!pnl || pnl.total === 0) return bot.sendMessage(msg.chat.id, "No resolved trades yet.");
+    const rate = ((pnl.wins / pnl.total) * 100).toFixed(1);
+    return bot.sendMessage(msg.chat.id,
+      `Performance\n\n` +
+      `Trades: ${pnl.total} | Wins: ${pnl.wins} | Losses: ${pnl.losses}\n` +
+      `Win rate: ${rate}%\n` +
+      `Net P&L: NGN ${pnl.net > 0 ? "+" : ""}${pnl.net.toFixed(2)}`
+    );
   });
 
-  // ───────────────────────── CANCEL ─────────────────────────
-  bot.onText(/\/cancel/, async (msg) => {
-    const chatId = msg.chat.id;
-    await updateUser(chatId, { setup_step: null });
-    return bot.sendMessage(chatId, `Cancelled.`);
+  // /cancel
+  bot.onText(/\/cancel/, async msg => {
+    await updateUser(msg.chat.id, { setup_step: null });
+    return bot.sendMessage(msg.chat.id, "Cancelled.");
   });
 
-  // ─────────────────── SINGLE MESSAGE HANDLER ───────────────────
-  // One handler for ALL plain-text flows — setup, category, limit, threshold.
-  // Keeps state isolated. marketMakerCommands.js handles mm_awaiting_market separately.
-  bot.on("message", async (msg) => {
+  // ─── Single message handler for all setup flows ───────────────────────────
+  bot.on("message", async msg => {
     if (!msg.text || msg.text.startsWith("/")) return;
-
     const chatId = msg.chat.id;
-    const user = await getUser(chatId);
-
+    const user   = await getUser(chatId);
     if (!user?.setup_step) return;
-
-    // Don't intercept market maker step — let marketMakerCommands handle it
-    if (user.setup_step === "mm_awaiting_market") return;
 
     const text = msg.text.trim();
 
     switch (user.setup_step) {
 
-      case SETUP.PUB: {
-        if (!text.startsWith("pk_")) {
-          return bot.sendMessage(chatId, `Invalid. Must start with pk_`);
-        }
-        await updateUser(chatId, {
-          bayse_pub_key: encrypt(text),
-          setup_step: SETUP.SEC,
-        });
-        return bot.sendMessage(chatId, `Got it. Now send your SECRET key (sk_...)`);
+      case STEP.PUB: {
+        if (!text.startsWith("pk_"))
+          return bot.sendMessage(chatId, "Invalid. Must start with pk_");
+        await updateUser(chatId, { bayse_pub_key: encrypt(text), setup_step: STEP.SEC });
+        return bot.sendMessage(chatId, "Got it. Now send your SECRET key (sk_...):");
       }
 
-      case SETUP.SEC: {
-        if (!text.startsWith("sk_")) {
-          return bot.sendMessage(chatId, `Invalid. Must start with sk_`);
-        }
-        const pub = decrypt(user.bayse_pub_key);
-        const valid = await validateKeys(pub, text);
-
-        if (!valid.valid) {
-          return bot.sendMessage(chatId, `Key validation failed. Check your keys and try /connect again.`);
-        }
-
-        await updateUser(chatId, {
-          bayse_sec_key: encrypt(text),
-          setup_step: null,
-        });
-        return bot.sendMessage(chatId, `✅ Keys saved.\n\nRun /setup to configure your engine.`);
+      case STEP.SEC: {
+        if (!text.startsWith("sk_"))
+          return bot.sendMessage(chatId, "Invalid. Must start with sk_");
+        const pub   = decrypt(user.bayse_pub_key);
+        const check = await validateKeys(pub, text);
+        if (!check.valid)
+          return bot.sendMessage(chatId, `Keys invalid: ${check.error}\n\nTry /connect again.`);
+        await updateUser(chatId, { bayse_sec_key: encrypt(text), setup_step: null });
+        return bot.sendMessage(chatId, "Keys saved and verified.\n\nRun /setup to configure, then /run to start.");
       }
 
-      case SETUP.THRESHOLD: {
-        const val = parseFloat(text);
-        if (isNaN(val) || val < 0.5 || val > 0.95) {
-          return bot.sendMessage(chatId, `Must be between 0.5 and 0.95`);
-        }
-        await updateUser(chatId, {
-          threshold: val,
-          setup_step: SETUP.LIMIT,
-        });
-        return bot.sendMessage(chatId, `Threshold set to ${val}.\n\nNow set max trade amount:`);
+      case STEP.THRESHOLD: {
+        const v = parseFloat(text);
+        if (isNaN(v) || v < 0.5 || v > 0.95)
+          return bot.sendMessage(chatId, "Must be between 0.5 and 0.95");
+        await updateUser(chatId, { threshold: v, setup_step: STEP.LIMIT });
+        return bot.sendMessage(chatId, `Threshold set to ${v}.\n\nMax trade amount (NGN):`);
       }
 
-      case SETUP.LIMIT: {
-        const amt = parseFloat(text);
-        if (isNaN(amt) || amt < 1) {
-          return bot.sendMessage(chatId, `Must be >= 1`);
-        }
-        await updateUser(chatId, {
-          max_trade_amount: amt,
-          setup_step: SETUP.CURRENCY,
-        });
-        return bot.sendMessage(chatId, `Max trade set to ${amt}.\n\nCurrency? Send USD or NGN:`);
-      }
-
-      case SETUP.CURRENCY: {
-        const cur = text.toUpperCase();
-        if (!["USD", "NGN"].includes(cur)) {
-          return bot.sendMessage(chatId, `USD or NGN only`);
-        }
-        await updateUser(chatId, {
-          currency: cur,
-          setup_step: SETUP.CATEGORY,
-        });
+      case STEP.LIMIT: {
+        const v = parseFloat(text);
+        if (isNaN(v) || v < 100)
+          return bot.sendMessage(chatId, "Minimum is NGN 100");
+        await updateUser(chatId, { max_trade_amount: v, setup_step: STEP.CATEGORY });
         return bot.sendMessage(chatId,
-          `Currency set to ${cur}.\n\nPreferred market category?\n\n` +
-          VALID_CATEGORIES.map((c, i) => `${i + 1}. ${c}`).join("\n") +
+          `Max trade set to NGN ${v}.\n\nPreferred category?\n\n` +
+          CATEGORIES.map((c, i) => `${i + 1}. ${c}`).join("\n") +
           `\n\nSend category name:`
         );
       }
 
-      case SETUP.CATEGORY: {
-        const cat = text.toLowerCase();
-        if (!VALID_CATEGORIES.includes(cat)) {
-          return bot.sendMessage(chatId,
-            `Invalid. Options: ${VALID_CATEGORIES.join(", ")}`
-          );
-        }
-        await updateUser(chatId, {
-          preferred_category: cat,
-          setup_step: null,
-        });
-        return bot.sendMessage(chatId,
-          `✅ Setup complete.\n\nCategory: ${cat}\n\n/run to start the engine.`
-        );
+      case STEP.CATEGORY: {
+        const v = text.toLowerCase();
+        if (!CATEGORIES.includes(v))
+          return bot.sendMessage(chatId, `Invalid. Options: ${CATEGORIES.join(", ")}`);
+        await updateUser(chatId, { preferred_category: v, setup_step: null });
+        return bot.sendMessage(chatId, `Setup complete.\n\nCategory: ${v}\n\n/run to start the engine.`);
       }
     }
   });
