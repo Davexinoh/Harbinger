@@ -3,6 +3,7 @@ import { shouldTrade }    from "./decisionGate.js";
 import { executeTrade }   from "./executor.js";
 import { getActiveUsers, getUnsettledEventIds, getUser } from "../db/database.js";
 import { sendTradeAlert, broadcastSignals } from "../bot/alerts.js";
+import { decrypt } from "../utils/encryption.js";
 
 const TICK_MS          = 60_000;
 const MIN_TRADE_GAP_MS = 15 * 60 * 1000;
@@ -58,8 +59,8 @@ async function tick() {
       await broadcastSignals(signals).catch(() => {});
     }
 
-    // Use first user's key to fetch markets — all users share same Bayse market pool
-    const pubKey    = Buffer.from(users[0].bayse_pub_key, "base64").toString("utf8");
+    // FIX: decrypt properly, not Buffer.from base64
+    const pubKey    = decrypt(users[0].bayse_pub_key);
     const unsettled = await getUnsettledEventIds(users[0].chat_id);
 
     for (const user of users) {
@@ -96,21 +97,24 @@ async function processUser(user, signals, pubKey, unsettled) {
   const last = lastTradeTimes.get(chatId) || 0;
   if (Date.now() - last < MIN_TRADE_GAP_MS) return;
 
-  // Pass user's preferred category to market finder — THIS was missing
+  // Pass preferred category — but fall back to ALL markets if none found
   const preferred = fresh.preferred_category && fresh.preferred_category !== "all"
     ? fresh.preferred_category
     : null;
 
   const match = await findMatchingMarket(signals, pubKey, unsettled, preferred);
-  if (!match) return;
+  if (!match) {
+    console.log(`[Engine] ${chatId} — no matching market found (category: ${preferred || "all"})`);
+    return;
+  }
 
   const key = makeTradeKey(chatId, match.event.id);
   if (isDuplicateTrade(key)) return;
 
-  const currency = fresh.currency || "USD";
-  const max      = parseFloat(fresh.max_trade_amount) || (currency === "NGN" ? 500 : 5);
+  const currency  = fresh.currency || "USD";
+  const max       = parseFloat(fresh.max_trade_amount) || (currency === "NGN" ? 500 : 5);
   const threshold = parseFloat(fresh.threshold) || 0.6;
-  const scale    = Math.min((signals.composite - threshold) / (0.95 - threshold), 1);
+  const scale     = Math.min((signals.composite - threshold) / (0.95 - threshold), 1);
 
   let amount = max * (0.5 + 0.5 * scale);
   if (currency === "NGN") amount = Math.max(Math.round(amount), 100);
