@@ -1,142 +1,87 @@
-import { runAllSignals, findMatchingMarket } from "./scorer.js";
-import { shouldTrade }    from "./decisionGate.js";
-import { executeTrade }   from "./executor.js";
-import { getActiveUsers, getUnsettledEventIds, getUser } from "../db/database.js";
-import { sendTradeAlert, broadcastSignals } from "../bot/alerts.js";
+import { runAllSignals } from "../signals/index.js";
+import { findMarket }    from "./scorer.js";
+import { executeTrade }  from "./executor.js";
+import { getActiveUsers, getOpenEventIds, getUser } from "../db/database.js";
 import { decrypt } from "../utils/encryption.js";
+import { sendAlert } from "../bot/alerts.js";
 
-const TICK_MS          = 60_000;
-const MIN_TRADE_GAP_MS = 15 * 60 * 1000;
+const TICK_MS = 60_000;
+let timer = null, running = false, activeCount = 0;
 
-let ticking         = false;
-let isRunning       = false;
-let tickTimer       = null;
-let activeUserCount = 0;
-
-const userLocks      = new Map();
-const lastTradeTimes = new Map();
-const executedKeys   = new Set();
-const EXEC_WINDOW    = 60_000;
-
-function makeTradeKey(userId, eventId) {
-  const bucket = Math.floor(Date.now() / EXEC_WINDOW);
-  return `${userId}:${eventId}:${bucket}`;
-}
-
-function isDuplicateTrade(key) {
-  if (executedKeys.has(key)) return true;
-  executedKeys.add(key);
-  setTimeout(() => executedKeys.delete(key), EXEC_WINDOW);
-  return false;
-}
+// Per-user processing lock — prevents concurrent ticks for same user
+const locks = new Map();
 
 export function startEngine() {
-  if (isRunning) return;
-  isRunning = true;
-  console.log("[Engine] Started");
+  if (running) return;
+  running = true;
+  console.log("[Engine] Started — tick every 60s");
   tick();
-  tickTimer = setInterval(tick, TICK_MS);
+  timer = setInterval(tick, TICK_MS);
 }
 
 export function stopEngine() {
-  if (tickTimer) clearInterval(tickTimer);
-  isRunning = false;
-}
-
-async function tick() {
-  if (ticking) return;
-  ticking = true;
-
-  try {
-    const users = await getActiveUsers();
-    activeUserCount = users.length;
-    if (!users.length) return;
-
-    const signals = await runAllSignals();
-    console.log(`[Engine] composite=${signals.composite.toFixed(2)}`);
-
-    if (signals.composite >= 0.60) {
-      await broadcastSignals(signals).catch(() => {});
-    }
-
-    // FIX: decrypt properly, not Buffer.from base64
-    const pubKey    = decrypt(users[0].bayse_pub_key);
-    const unsettled = await getUnsettledEventIds(users[0].chat_id);
-
-    for (const user of users) {
-      processUserSafe(user, signals, pubKey, unsettled);
-    }
-
-  } catch (err) {
-    console.error("[Engine] Tick error:", err.message);
-  } finally {
-    ticking = false;
-  }
-}
-
-async function processUserSafe(user, signals, pubKey, unsettled) {
-  const id = user.chat_id;
-  if (userLocks.get(id)) return;
-  userLocks.set(id, true);
-  try {
-    await processUser(user, signals, pubKey, unsettled);
-  } finally {
-    userLocks.delete(id);
-  }
-}
-
-async function processUser(user, signals, pubKey, unsettled) {
-  const chatId = user.chat_id;
-
-  const fresh = await getUser(chatId);
-  if (!fresh?.engine_active) return;
-
-  const decision = shouldTrade(signals, fresh);
-  if (!decision.fire) return;
-
-  const last = lastTradeTimes.get(chatId) || 0;
-  if (Date.now() - last < MIN_TRADE_GAP_MS) return;
-
-  // Pass preferred category — but fall back to ALL markets if none found
-  const preferred = fresh.preferred_category && fresh.preferred_category !== "all"
-    ? fresh.preferred_category
-    : null;
-
-  const match = await findMatchingMarket(signals, pubKey, unsettled, preferred);
-  if (!match) {
-    console.log(`[Engine] ${chatId} — no matching market found (category: ${preferred || "all"})`);
-    return;
-  }
-
-  const key = makeTradeKey(chatId, match.event.id);
-  if (isDuplicateTrade(key)) return;
-
-  const currency  = fresh.currency || "USD";
-  const max       = parseFloat(fresh.max_trade_amount) || (currency === "NGN" ? 500 : 5);
-  const threshold = parseFloat(fresh.threshold) || 0.6;
-  const scale     = Math.min((signals.composite - threshold) / (0.95 - threshold), 1);
-
-  let amount = max * (0.5 + 0.5 * scale);
-  if (currency === "NGN") amount = Math.max(Math.round(amount), 100);
-  else                    amount = Math.max(parseFloat(amount.toFixed(2)), 1);
-
-  decision.amount = amount;
-
-  const latest = await getUser(chatId);
-  if (!latest?.engine_active) return;
-
-  try {
-    const result = await executeTrade(latest, match, decision);
-    lastTradeTimes.set(chatId, Date.now());
-    await sendTradeAlert(chatId, result, decision);
-    console.log(`[Engine] ${chatId} ✓ ${match.event.title}`);
-  } catch (err) {
-    lastTradeTimes.set(chatId, Date.now());
-    await sendTradeAlert(chatId, null, decision, err.message);
-    console.error(`[Engine] ${chatId} failed:`, err.message);
-  }
+  clearInterval(timer);
+  running = false;
 }
 
 export function getEngineStatus() {
-  return { running: isRunning, activeUsers: activeUserCount };
+  return { running, activeUsers: activeCount };
+}
+
+async function tick() {
+  try {
+    const users = await getActiveUsers();
+    activeCount = users.length;
+    if (!users.length) return;
+
+    // Use first user's pub key for market fetching (public endpoint)
+    const pubKey   = decrypt(users[0].bayse_pub_key);
+    const signals  = await runAllSignals(pubKey);
+
+    console.log(`[Engine] composite=${signals.composite.toFixed(3)} | ${users.length} active users`);
+
+    for (const user of users) {
+      if (!locks.get(user.chat_id)) {
+        locks.set(user.chat_id, true);
+        processUser(user, signals, pubKey)
+          .finally(() => locks.delete(user.chat_id));
+      }
+    }
+  } catch (err) {
+    console.error("[Engine] Tick error:", err.message);
+  }
+}
+
+async function processUser(user, signals, pubKey) {
+  try {
+    // Re-fetch from DB — ensure engine_active is still true
+    const fresh = await getUser(user.chat_id);
+    if (!fresh?.engine_active) return;
+
+    const threshold = parseFloat(fresh.threshold) || 0.6;
+    if (signals.composite < threshold) return;
+
+    // Check what events this user already has open trades on
+    const excluded = await getOpenEventIds(fresh.chat_id);
+
+    const preferred = fresh.preferred_category || "all";
+    const match     = await findMarket(pubKey, preferred, excluded);
+    if (!match) return;
+
+    const result = await executeTrade(fresh, match, signals);
+
+    await sendAlert(fresh.chat_id,
+      `✅ Trade Executed\n\n` +
+      `${match.event.title}\n` +
+      `${result.direction} | ₦${result.amount}\n` +
+      `Fill: ${result.outcomeLabel}\n\n` +
+      `Composite: ${(signals.composite * 100).toFixed(0)}%`
+    );
+
+  } catch (err) {
+    console.error(`[Engine] ${user.chat_id} failed:`, err.message);
+    await sendAlert(user.chat_id,
+      `⚠️ Trade Failed\n\nConfidence: ${(signals.composite * 100).toFixed(0)}%\nError: ${err.message}`
+    ).catch(() => {});
+  }
 }
