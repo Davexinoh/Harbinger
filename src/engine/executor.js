@@ -1,4 +1,4 @@
-import { getQuote, placeOrder, resolveOutcomeId } from "../bayse/client.js";
+import { placeOrder, resolveOutcomeId } from "../bayse/client.js";
 import { insertTrade } from "../db/database.js";
 import { decrypt } from "../utils/encryption.js";
 
@@ -36,16 +36,13 @@ export async function executeTrade(user, match, decision) {
       ? Number(user.max_trade_amount)
       : currency === "NGN" ? 500 : 5;
 
-    const amount = Math.min(
-      currency === "NGN"
-        ? Math.max(Math.round(rawAmount), 100)
-        : Math.max(Number(rawAmount.toFixed(2)), 1),
-      maxCap
-    );
+    // Enforce minimums — NGN min is 100, USD min is 1
+    const amount = currency === "NGN"
+      ? Math.max(Math.min(Math.round(rawAmount), maxCap), 100)
+      : Math.max(Math.min(Number(rawAmount.toFixed(2)), maxCap), 1);
 
     console.log(`[Executor] ${user.chat_id} | event:${event.id} | market:${market.id} | engine:${event.engine} | outcomeId:${outcomeId} | amount:${amount} | currency:${currency}`);
 
-    // Skip quote — go straight to order to avoid double-roundtrip 400s
     const orderPayload = { side, outcomeId, amount, type: "MARKET", currency };
 
     const order = await placeOrder(publicKey, secretKey, event.id, market.id, orderPayload);
