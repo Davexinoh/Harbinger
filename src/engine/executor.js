@@ -18,15 +18,13 @@ export async function executeTrade(user, match, decision) {
   const currency = user.currency || "USD";
   const side     = "BUY";
 
-  // Validate amount
   const rawAmount = Number(decision.amount);
   if (!Number.isFinite(rawAmount) || rawAmount <= 0) {
     throw new Error(`Invalid trade amount: ${decision.amount}`);
   }
 
-  // Resolve outcomeId — force string
-  const resolved   = resolveOutcomeId(market, suggestedOutcome);
-  const outcomeId  = resolved?.outcomeId != null ? String(resolved.outcomeId) : null;
+  const resolved  = resolveOutcomeId(market, suggestedOutcome);
+  const outcomeId = resolved?.outcomeId != null ? String(resolved.outcomeId) : null;
   if (!outcomeId) throw new Error(`Could not resolve outcomeId for: ${suggestedOutcome}`);
 
   const key = tradeKey(event.id, market.id, outcomeId);
@@ -45,32 +43,12 @@ export async function executeTrade(user, match, decision) {
       maxCap
     );
 
-    // Preflight — log exact payload before sending to Bayse
-    console.log(`[Executor] ${user.chat_id} preflight:`, JSON.stringify({
-      eventId:   event.id,
-      marketId:  market.id,
-      eventEngine: event.engine || "unknown",
-      outcomeId,
-      side,
-      amount,
-      type:      "MARKET",
-      currency,
-    }));
+    console.log(`[Executor] ${user.chat_id} | event:${event.id} | market:${market.id} | engine:${event.engine} | outcomeId:${outcomeId} | amount:${amount} | currency:${currency}`);
 
-    const quote = await getQuote(
-      publicKey, event.id, market.id,
-      outcomeId, side, amount, currency
-    );
-
-    const price = quote?.price ?? quote?.expectedPrice;
-    if (!Number.isFinite(price)) throw new Error("Invalid quote price");
-    if (price < 0.03 || price > 0.97) throw new Error(`Unsafe market price: ${price}`);
-
+    // Skip quote — go straight to order to avoid double-roundtrip 400s
     const orderPayload = { side, outcomeId, amount, type: "MARKET", currency };
 
-    const order = await placeOrder(
-      publicKey, secretKey, event.id, market.id, orderPayload
-    );
+    const order = await placeOrder(publicKey, secretKey, event.id, market.id, orderPayload);
 
     const tradeRecord = {
       chat_id:        String(user.chat_id),
@@ -84,12 +62,12 @@ export async function executeTrade(user, match, decision) {
       outcome:        suggestedOutcome,
       amount,
       currency,
-      expected_price: price,
+      expected_price: market.outcome1Price || 0.5,
       status:         "open",
     };
 
     const result = await insertTrade(tradeRecord);
-    return { tradeId: result.id, order, quote, tradeRecord };
+    return { tradeId: result.id, order, tradeRecord };
 
   } finally {
     ACTIVE_TRADES.delete(key);
