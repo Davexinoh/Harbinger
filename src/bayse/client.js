@@ -1,21 +1,20 @@
 import crypto from "crypto";
 import fetch  from "node-fetch";
 
-const BASE_URL = "https://relay.bayse.markets";
+const BASE = "https://relay.bayse.markets";
 
-// ─── HMAC signed request ──────────────────────────────────────────────────────
-
-export async function signedRequest(publicKey, secretKey, method, path, body = null) {
+// ─── HMAC signed request (Write auth) ────────────────────────────────────────
+export async function signedRequest(pubKey, secKey, method, path, body = null) {
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const bodyStr   = body ? JSON.stringify(body) : "";
   const bodyHash  = crypto.createHash("sha256").update(bodyStr).digest("hex");
   const payload   = `${timestamp}.${method}.${path}.${bodyHash}`;
-  const signature = crypto.createHmac("sha256", secretKey).update(payload).digest("base64");
+  const signature = crypto.createHmac("sha256", secKey).update(payload).digest("base64");
 
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const res = await fetch(`${BASE}${path}`, {
     method,
     headers: {
-      "X-Public-Key": publicKey,
+      "X-Public-Key": pubKey,
       "X-Timestamp":  timestamp,
       "X-Signature":  signature,
       "Content-Type": "application/json",
@@ -23,150 +22,83 @@ export async function signedRequest(publicKey, secretKey, method, path, body = n
     body: bodyStr || undefined,
   });
 
-  if (!res.ok) throw new Error(`Bayse ${res.status}: ${await res.text()}`);
-  return res.json();
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Bayse ${res.status}: ${text}`);
+  return JSON.parse(text);
 }
 
-// ─── Read request ─────────────────────────────────────────────────────────────
-
-export async function readRequest(publicKey, path) {
-  const headers = publicKey ? { "X-Public-Key": publicKey } : {};
-  const res     = await fetch(`${BASE_URL}${path}`, { headers });
-  if (!res.ok) throw new Error(`Bayse ${res.status}: ${await res.text()}`);
-  return res.json();
+// ─── Read request (Read auth) ─────────────────────────────────────────────────
+export async function readRequest(pubKey, path) {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { "X-Public-Key": pubKey },
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Bayse ${res.status}: ${text}`);
+  return JSON.parse(text);
 }
 
 // ─── Events ───────────────────────────────────────────────────────────────────
-
-export async function getEvents(publicKey, params = {}) {
-  const q = new URLSearchParams();
-  q.set("status", params.status || "open");
-  q.set("page",   params.page   || 1);
-  q.set("size",   params.size   || 50);
-  if (params.category) q.set("category", params.category);
-  if (params.keyword)  q.set("keyword",  params.keyword);
-  const data = await readRequest(publicKey, `/v1/pm/events?${q.toString()}`);
+export async function getEvents(pubKey, { status = "open", category, size = 50, page = 1, currency = "NGN" } = {}) {
+  const q = new URLSearchParams({ status, size, page, currency });
+  if (category) q.set("category", category);
+  const data = await readRequest(pubKey, `/v1/pm/events?${q}`);
   return data?.events || [];
 }
 
-export async function getEventById(publicKey, eventId) {
-  return readRequest(publicKey, `/v1/pm/events/${eventId}`);
+export async function getEventById(pubKey, eventId) {
+  return readRequest(pubKey, `/v1/pm/events/${eventId}`);
 }
 
-// ─── Quote ────────────────────────────────────────────────────────────────────
-
-export async function getQuote(publicKey, eventId, marketId, outcomeId, side, amount, currency = "USD") {
-  const headers = { "Content-Type": "application/json", ...(publicKey ? { "X-Public-Key": publicKey } : {}) };
-  const res = await fetch(`${BASE_URL}/v1/pm/events/${eventId}/markets/${marketId}/quote`, {
-    method: "POST", headers,
-    body:   JSON.stringify({ side, outcomeId, amount, currency }),
-  });
-  if (!res.ok) throw new Error(`Bayse quote ${res.status}: ${await res.text()}`);
-  return res.json();
+// ─── Place order ──────────────────────────────────────────────────────────────
+// Docs: POST /v1/pm/events/{eventId}/markets/{marketId}/orders
+// Required body: side, outcomeId, amount, type, currency
+// NGN minimum: ₦100
+export async function placeOrder(pubKey, secKey, eventId, marketId, body) {
+  const path = `/v1/pm/events/${eventId}/markets/${marketId}/orders`;
+  return signedRequest(pubKey, secKey, "POST", path, body);
 }
 
-// ─── Orders ───────────────────────────────────────────────────────────────────
-
-export async function placeOrder(publicKey, secretKey, eventId, marketId, orderBody) {
-  return signedRequest(
-    publicKey,
-    secretKey,
-    "POST",
-    `/v1/pm/events/${eventId}/markets/${marketId}/orders`,
-    orderBody
-  );
-}
-
-export async function cancelOrder(publicKey, secretKey, eventId, marketId, orderId) {
-  return signedRequest(publicKey, secretKey, "DELETE", `/v1/pm/events/${eventId}/markets/${marketId}/orders/${orderId}`);
-}
-
-export async function getOpenOrders(publicKey, secretKey, eventId, marketId) {
-  return signedRequest(publicKey, secretKey, "GET", `/v1/pm/events/${eventId}/markets/${marketId}/orders`);
-}
-
-// ─── Portfolio & wallet ───────────────────────────────────────────────────────
-
-export async function getPortfolio(publicKey, secretKey) {
-  return signedRequest(publicKey, secretKey, "GET", "/v1/pm/portfolio");
-}
-
-export async function getWalletAssets(publicKey, secretKey) {
-  return signedRequest(publicKey, secretKey, "GET", "/v1/wallet/assets");
-}
-
-export async function getLiquidityRewards(publicKey, secretKey) {
-  return signedRequest(publicKey, secretKey, "GET", "/v1/pm/liquidity-rewards/active");
+// ─── Portfolio ────────────────────────────────────────────────────────────────
+// Read auth only — returns { outcomeBalances, portfolioCost, portfolioCurrentValue, ... }
+export async function getPortfolio(pubKey) {
+  return readRequest(pubKey, "/v1/pm/portfolio");
 }
 
 // ─── Validate keys ────────────────────────────────────────────────────────────
-
-export async function validateKeys(publicKey, secretKey) {
+export async function validateKeys(pubKey, secKey) {
   try {
-    await getPortfolio(publicKey, secretKey);
+    // Use a signed GET to verify both keys work
+    await signedRequest(pubKey, secKey, "GET", "/v1/pm/portfolio", null);
     return { valid: true };
   } catch (err) {
     return { valid: false, error: err.message };
   }
 }
 
-// ─── resolveOutcomeId ─────────────────────────────────────────────────────────
-// Handles ALL Bayse market shapes:
-// - YES/NO markets (standard)
-// - Up/Down markets (BTC 15m)
-// - Custom label markets (elections etc)
-// - outcomes[] array shape
-// Returns { outcomeId, outcomeLabel }
+// ─── Resolve outcomeId from market ───────────────────────────────────────────
+// Docs confirm market has: outcome1Id, outcome1Label, outcome2Id, outcome2Label
+// direction is "YES" or "NO"
+export function resolveOutcomeId(market, direction) {
+  const dir = direction.toUpperCase();
 
-export function resolveOutcomeId(market, suggestedOutcome) {
-  const target = suggestedOutcome.toUpperCase();
+  // Normalise labels
+  const label1 = (market.outcome1Label || "").toUpperCase();
+  const label2 = (market.outcome2Label || "").toUpperCase();
 
-  // Shape 1: outcomes[] array
-  if (Array.isArray(market.outcomes) && market.outcomes.length >= 2) {
-    const bullish = ["YES", "UP", "OVER", "WIN", "TRUE"];
-    const bearish  = ["NO", "DOWN", "UNDER", "LOSS", "FALSE"];
+  const bullish = ["YES", "UP", "OVER", "WIN", "TRUE", "HIGHER"];
+  const bearish  = ["NO",  "DOWN", "UNDER", "LOSS", "FALSE", "LOWER"];
 
-    for (const o of market.outcomes) {
-      const label = (o.label || o.name || o.title || "").toUpperCase();
-      if (bullish.includes(target) && (bullish.includes(label) || bullish.some(b => label.includes(b)))) {
-        return { outcomeId: o.id || o.outcomeId, outcomeLabel: o.label || o.name || target };
-      }
-      if (bearish.includes(target) && (bearish.includes(label) || bearish.some(b => label.includes(b)))) {
-        return { outcomeId: o.id || o.outcomeId, outcomeLabel: o.label || o.name || target };
-      }
-    }
-    // Fallback: YES/UP → first, NO/DOWN → second
-    const idx = ["YES", "UP"].includes(target) ? 0 : 1;
-    const o   = market.outcomes[idx];
-    return { outcomeId: o.id || o.outcomeId, outcomeLabel: o.label || o.name || target };
+  const wantBull = dir === "YES" || dir === "UP";
+
+  // Try label match first
+  if (wantBull) {
+    if (bullish.some(b => label1.includes(b))) return { outcomeId: market.outcome1Id, outcomeLabel: market.outcome1Label };
+    if (bullish.some(b => label2.includes(b))) return { outcomeId: market.outcome2Id, outcomeLabel: market.outcome2Label };
+    // Positional fallback
+    return { outcomeId: market.outcome1Id, outcomeLabel: market.outcome1Label || "YES" };
+  } else {
+    if (bearish.some(b => label1.includes(b))) return { outcomeId: market.outcome1Id, outcomeLabel: market.outcome1Label };
+    if (bearish.some(b => label2.includes(b))) return { outcomeId: market.outcome2Id, outcomeLabel: market.outcome2Label };
+    return { outcomeId: market.outcome2Id, outcomeLabel: market.outcome2Label || "NO" };
   }
-
-  // Shape 2: outcome1Id/outcome2Id fields
-  const o1Label = (market.outcome1Label || market.option1Label || "").toUpperCase();
-  const o2Label = (market.outcome2Label || market.option2Label || "").toUpperCase();
-  const o1Id    = market.outcome1Id || market.option1Id;
-  const o2Id    = market.outcome2Id || market.option2Id;
-
-  const bullishLabels = ["YES", "UP", "OVER", "WIN"];
-  const bearishLabels = ["NO", "DOWN", "UNDER", "LOSS"];
-  const isBullishTarget = ["YES", "UP"].includes(target);
-
-  if (isBullishTarget && (bullishLabels.some(l => o1Label.includes(l)) || o1Label === target)) {
-    return { outcomeId: o1Id, outcomeLabel: market.outcome1Label || market.option1Label || target };
-  }
-  if (!isBullishTarget && (bearishLabels.some(l => o1Label.includes(l)) || o1Label === target)) {
-    return { outcomeId: o1Id, outcomeLabel: market.outcome1Label || market.option1Label || target };
-  }
-  if (isBullishTarget && (bullishLabels.some(l => o2Label.includes(l)) || o2Label === target)) {
-    return { outcomeId: o2Id, outcomeLabel: market.outcome2Label || market.option2Label || target };
-  }
-  if (!isBullishTarget && (bearishLabels.some(l => o2Label.includes(l)) || o2Label === target)) {
-    return { outcomeId: o2Id, outcomeLabel: market.outcome2Label || market.option2Label || target };
-  }
-
-  // No label match — positional fallback
-  if (isBullishTarget) {
-    return { outcomeId: o1Id, outcomeLabel: market.outcome1Label || market.option1Label || "YES" };
-  }
-  return { outcomeId: o2Id, outcomeLabel: market.outcome2Label || market.option2Label || "NO" };
 }
