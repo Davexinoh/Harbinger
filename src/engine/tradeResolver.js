@@ -1,7 +1,7 @@
-import { getOpenTrades, updateTrade, getPool } from "../db/database.js";
-import { getPortfolio, getEventById }           from "../bayse/client.js";
-import { decrypt }                              from "../utils/encryption.js";
-import { calculateFee, recordLoss, recordWin }  from "./riskManager.js";
+import { getOpenTrades, updateTrade } from "../db/database.js";
+import { getPortfolio, getEventById } from "../bayse/client.js";
+import { decrypt }                    from "../utils/encryption.js";
+import { calculateFee, recordLoss, recordWin } from "./riskManager.js";
 
 let bot           = null;
 let resolverTimer = null;
@@ -42,8 +42,8 @@ async function resolveSingleTrade(trade) {
   const secKey = decrypt(trade.bayse_sec_key);
 
   try {
-    const event   = await getEventById(pubKey, trade.event_id);
-    const resolved = await tryResolveFromEvent(trade, event, pubKey, secKey);
+    const event    = await getEventById(pubKey, trade.event_id);
+    const resolved = await tryResolveFromEvent(trade, event);
     if (resolved) return;
   } catch (err) {
     console.log(`[Resolver] Event fetch failed for trade ${trade.id}: ${err.message}`);
@@ -56,7 +56,7 @@ async function resolveSingleTrade(trade) {
   }
 }
 
-async function tryResolveFromEvent(trade, event, pubKey, secKey) {
+async function tryResolveFromEvent(trade, event) {
   if (!event) return false;
 
   const markets = event.markets || event.data?.markets || [];
@@ -77,15 +77,17 @@ async function tryResolveFromEvent(trade, event, pubKey, secKey) {
     return false;
   }
 
-  console.log(`[Resolver] Trade ${trade.id} — resolved via event endpoint`);
-
   const winningOutcomeId = market.winningOutcomeId
-  solvedOutcomeId
+    || market.resolvedOutcomeId
     || market.result
-    || market.wi
+    || market.winner;
+
   let won = null;
 
-  if (winningOutcomeId) {(market.outcome1Label || "").toUpperCase();
+  if (winningOutcomeId) {
+    const ourOutcome    = trade.outcome;
+    const outcome1Wins  = winningOutcomeId === market.outcome1Id;
+    const outcome1Label = (market.outcome1Label || "").toUpperCase();
 
     if (outcome1Label === "YES" || outcome1Label.includes("UP")) {
       won = outcome1Wins ? ourOutcome === "YES" : ourOutcome === "NO";
@@ -97,67 +99,52 @@ async function tryResolveFromEvent(trade, event, pubKey, secKey) {
   }
 
   const entryPrice = trade.expected_price || 0.5;
-   = trade.amount;
+  const amount     = trade.amount;
   let   rawPnl;
 
-  if (won === true) {
-    rawPnl = parseFloat((amount * (1 - entryPrice) / entryPrice).toFixed(2));
-  } else if (won === false) {
-    rawPnl = -amount;
-  } else {
-    return false;
-  }
+  if (won === true)       rawPnl = parseFloat((amount * (1 - entryPrice) / entryPrice).toFixed(2));
+  else if (won === false) rawPnl = -amount;
+  else                    return false;
 
   await settleTradeRecord(trade, rawPnl);
   return true;
 }
 
+// Bayse portfolio shape: { outcomeBalances: [...] }
+// Each entry: { cost, currentValue, currency, market: { id, event: { id, status } } }
 async function tryResolveFromPortfolio(trade, pubKey, secKey) {
   const portfolio = await getPortfolio(pubKey, secKey);
+  const balances  = portfolio?.outcomeBalances;
 
-  if (!portfolio._logged) {
-    console.log(`[Resolver] Portfolio keys:`, Object.keys(portfolio || {}));
-    console.log(`[Resolver] Portfolio sample:`, JSON.stringify(portfolio).slice(0, 600));
-    portfolio._logged = true;
+  if (!Array.isArray(balances)) {
+    console.log(`[Resolver] Trade ${trade.id} — unexpected portfolio shape:`, Object.keys(portfolio || {}));
+    return;
   }
 
-  const positions = (
-    portfolio?.positions       ||
-    portfolio?.data?.positions ||
-    portfolio?.orders          ||
-    portfolio?.trades          ||
-    portfolio?.data            ||
-    []
+  const entry = balances.find(b =>
+    b.market?.id        === trade.market_id ||
+    b.market?.event?.id === trade.event_id
   );
 
-  if (!Array.isArray(positions)) return;
+  if (!entry) {
+    console.log(`[Resolver] Trade ${trade.id} — not found in outcomeBalances`);
+    return;
+  }
 
-  const position = positions.find(p =>
-    p.eventId   === trade.event_id  ||
-    p.event_id  === trade.event_id  ||
-    p.marketId  === trade.market_id ||
-    p.market_id === trade.market_id
-  );
+  const eventStatus = (entry.market?.event?.status || "").toLowerCase();
+  const isSettled   = ["resolved", "settled", "closed", "completed", "finished"]
+    .some(s => eventStatus.includes(s));
 
-  if (!position) return;
+  if (!isSettled) {
+    console.log(`[Resolver] Trade ${trade.id} — portfolio entry found, event not yet settled (${eventStatus})`);
+    return;
+  }
 
-  const status     = (position.status || position.settlementStatus || position.state || "").toLowerCase();
-  const isResolved = ["resolved","settled","closed","won","lost","complete"].includes(status)
-    || position.profit       != null
-    || position.pnl          != null
-    || position.returnAmount != null;
+  const cost         = Number(entry.cost         || 0);
+  const currentValue = Number(entry.currentValue || 0);
+  const rawPnl       = parseFloat((currentValue - cost).toFixed(2));
 
-  if (!isResolved) return;
-
-  const rawPnl = parseFloat(
-    position.profit       ??
-    position.pnl          ??
-    position.returnAmount ??
-    position.winAmount    ??
-    position.netPnl       ??
-    0
-  );
-
+  console.log(`[Resolver] Trade ${trade.id} — portfolio settled | cost:${cost} value:${currentValue} pnl:${rawPnl}`);
   await settleTradeRecord(trade, rawPnl);
 }
 
@@ -183,14 +170,14 @@ async function settleTradeRecord(trade, rawPnl) {
   const icon   = userPnl > 0 ? "✅" : userPnl === 0 ? "⚪" : "❌";
   const result = userPnl > 0 ? "Won" : userPnl === 0 ? "Pushed" : "Lost";
   const pnlStr = `${userPnl >= 0 ? "+" : ""}${userPnl.toFixed(2)} ${trade.currency}`;
-  const feeStr = platformFee > 0 ? `\nFee: $pauser {platformFee.toFixed(2)} ${trade.currency}` : "";
+  const feeStr = platformFee > 0 ? `\nFee: ${platformFee.toFixed(2)} ${trade.currency}` : "";
 
   await bot.sendMessage(
     trade.chat_id,
     `${icon} Trade Settled\n\n` +
     `${trade.event_title}\n` +
     `${trade.side} ${trade.outcome_label || trade.outcome}\n` +
-    `${trade.currency} ${trade.amouhodkd nt} @ ${(trade.expected_price * 100).toFixed(1)}c\n\n` +
+    `${trade.currency} ${trade.amount} @ ${(trade.expected_price * 100).toFixed(1)}c\n\n` +
     `Result: ${result}\n` +
     `P&L: ${pnlStr}${feeStr}\n\n` +
     `/pnl for your full summary`
