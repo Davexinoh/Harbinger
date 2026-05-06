@@ -1,5 +1,4 @@
 import pg from "pg";
-import { encrypt, decrypt } from "../utils/encryption.js";
 
 const { Pool } = pg;
 
@@ -26,7 +25,7 @@ export async function initSchema() {
         bayse_pub_key      TEXT,
         bayse_sec_key      TEXT,
         threshold          REAL    NOT NULL DEFAULT 0.60,
-        max_trade_usd      REAL    NOT NULL DEFAULT 5.0,
+        max_trade_amount   REAL    NOT NULL DEFAULT 5.0,
         currency           TEXT    NOT NULL DEFAULT 'USD',
         preferred_category TEXT,
         engine_active      INTEGER NOT NULL DEFAULT 0,
@@ -102,10 +101,13 @@ export async function initSchema() {
       ON CONFLICT DO NOTHING;
     `);
 
-    // Safe migrations — add columns that may not exist in older DBs
+    // Migrations — rename max_trade_usd to max_trade_amount on live DBs
     const migrations = [
       `ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_category TEXT`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS max_trade_amount REAL NOT NULL DEFAULT 5.0`,
       `ALTER TABLE trades ADD COLUMN IF NOT EXISTS outcome_label TEXT`,
+      // Copy existing values from old column if it exists
+      `UPDATE users SET max_trade_amount = max_trade_usd WHERE max_trade_amount = 5.0 AND max_trade_usd IS NOT NULL`,
     ];
     for (const m of migrations) {
       try { await client.query(m); } catch (_) {}
@@ -136,11 +138,16 @@ export async function updateUser(chatId, fields) {
   const keys = Object.keys(fields);
   const vals = keys.map(k => fields[k]);
   const set  = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
-  await getPool().query(`UPDATE users SET ${set} WHERE chat_id = $${keys.length + 1}`, [...vals, String(chatId)]);
+  await getPool().query(
+    `UPDATE users SET ${set} WHERE chat_id = $${keys.length + 1}`,
+    [...vals, String(chatId)]
+  );
 }
 
 export async function getActiveUsers() {
-  const res = await getPool().query("SELECT * FROM users WHERE engine_active = 1");
+  const res = await getPool().query(
+    "SELECT * FROM users WHERE engine_active = 1 AND bayse_pub_key IS NOT NULL AND bayse_sec_key IS NOT NULL"
+  );
   return res.rows;
 }
 
@@ -166,7 +173,10 @@ export async function updateTrade(id, fields) {
   const keys = Object.keys(fields);
   const vals = keys.map(k => fields[k]);
   const set  = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
-  await getPool().query(`UPDATE trades SET ${set} WHERE id = $${keys.length + 1}`, [...vals, id]);
+  await getPool().query(
+    `UPDATE trades SET ${set} WHERE id = $${keys.length + 1}`,
+    [...vals, id]
+  );
 }
 
 export async function getRecentTrades(chatId, limit = 10) {
@@ -178,20 +188,28 @@ export async function getRecentTrades(chatId, limit = 10) {
 }
 
 export async function getOpenTrades() {
-  const res = await getPool().query(
-    "SELECT t.*, u.bayse_pub_key, u.bayse_sec_key FROM trades t JOIN users u ON u.chat_id = t.chat_id WHERE t.status = 'open' ORDER BY t.executed_at ASC"
-  );
+  // Only fetch trades where user still has keys — skips disconnected users
+  const res = await getPool().query(`
+    SELECT t.*, u.bayse_pub_key, u.bayse_sec_key
+    FROM trades t
+    JOIN users u ON u.chat_id = t.chat_id
+    WHERE t.status = 'open'
+      AND u.bayse_pub_key IS NOT NULL
+      AND u.bayse_sec_key IS NOT NULL
+    ORDER BY t.executed_at ASC
+  `);
   return res.rows;
 }
 
 export async function getPnL(chatId) {
   const res = await getPool().query(`
     SELECT
-      COUNT(*)::int                                            AS total_trades,
+      COUNT(*)::int                                            AS total,
       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::int          AS wins,
       SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END)::int         AS losses,
-      COALESCE(SUM(pnl), 0)                                   AS total_pnl,
-      COALESCE(AVG(confidence), 0)                            AS avg_confidence
+      COALESCE(SUM(pnl), 0)                                   AS net,
+      COALESCE(AVG(confidence), 0)                            AS avg_confidence,
+      MAX(currency)                                           AS currency
     FROM trades
     WHERE chat_id = $1 AND status = 'resolved'
   `, [String(chatId)]);
@@ -212,9 +230,9 @@ export async function getLeaderboard(limit = 10) {
   const res = await getPool().query(`
     SELECT
       u.chat_id, u.username,
-      COUNT(t.id)::int                                          AS total_trades,
+      COUNT(t.id)::int                                          AS total,
       SUM(CASE WHEN t.pnl > 0 THEN 1 ELSE 0 END)::int         AS wins,
-      COALESCE(SUM(t.pnl), 0)                                  AS total_pnl,
+      COALESCE(SUM(t.pnl), 0)                                  AS net,
       CASE WHEN COUNT(t.id) > 0
         THEN ROUND(SUM(CASE WHEN t.pnl > 0 THEN 1 ELSE 0 END)::numeric / COUNT(t.id) * 100, 1)
         ELSE 0 END                                             AS win_rate
@@ -222,7 +240,7 @@ export async function getLeaderboard(limit = 10) {
     LEFT JOIN trades t ON t.chat_id = u.chat_id AND t.status = 'resolved'
     GROUP BY u.chat_id, u.username
     HAVING COUNT(t.id) >= 3
-    ORDER BY win_rate DESC, total_pnl DESC
+    ORDER BY win_rate DESC, net DESC
     LIMIT $1
   `, [limit]);
   return res.rows;
@@ -244,7 +262,10 @@ export async function getGroups() {
 }
 
 export async function removeGroup(groupId) {
-  await getPool().query("UPDATE groups_list SET broadcast = 0 WHERE group_id = $1", [String(groupId)]);
+  await getPool().query(
+    "UPDATE groups_list SET broadcast = 0 WHERE group_id = $1",
+    [String(groupId)]
+  );
 }
 
 // ─── Signal log ───────────────────────────────────────────────────────────────
@@ -268,14 +289,17 @@ export async function insertPoll(poll) {
 }
 
 export async function getPollByTelegramId(telegramPollId) {
-  const res = await getPool().query("SELECT * FROM polls WHERE telegram_poll_id = $1", [String(telegramPollId)]);
+  const res = await getPool().query(
+    "SELECT * FROM polls WHERE telegram_poll_id = $1",
+    [String(telegramPollId)]
+  );
   return res.rows[0] || null;
 }
 
 export async function updatePollVotes(telegramPollId, votesYes, votesNo, votesUnsure) {
-  const total       = votesYes + votesNo + votesUnsure;
-  const unsurePct   = total > 0 ? votesUnsure / total : 0;
-  const crowdScore  = total > 0 ? (votesYes / total) * (1 - unsurePct * 0.4) : null;
+  const total      = votesYes + votesNo + votesUnsure;
+  const unsurePct  = total > 0 ? votesUnsure / total : 0;
+  const crowdScore = total > 0 ? (votesYes / total) * (1 - unsurePct * 0.4) : null;
   await getPool().query(`
     UPDATE polls SET votes_yes=$1, votes_no=$2, votes_unsure=$3, crowd_score=$4
     WHERE telegram_poll_id=$5
@@ -319,6 +343,9 @@ export async function getCrowdCalibration() {
 }
 
 export async function getRecentPolls(limit = 5) {
-  const res = await getPool().query("SELECT * FROM polls ORDER BY posted_at DESC LIMIT $1", [limit]);
+  const res = await getPool().query(
+    "SELECT * FROM polls ORDER BY posted_at DESC LIMIT $1",
+    [limit]
+  );
   return res.rows;
 }
