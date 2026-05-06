@@ -1,72 +1,64 @@
 import { placeOrder, resolveOutcomeId } from "../bayse/client.js";
-import { insertTrade } from "../db/database.js";
 import { decrypt } from "../utils/encryption.js";
+import { insertTrade } from "../db/database.js";
 
-const ACTIVE_TRADES = new Set();
+const inFlight = new Set(); // per event+market dedup
 
-function tradeKey(eventId, marketId, outcomeId) {
-  return `${eventId}:${marketId}:${outcomeId}`;
-}
+export async function executeTrade(user, match, signals) {
+  const pubKey = decrypt(user.bayse_pub_key);
+  const secKey = decrypt(user.bayse_sec_key);
+  if (!pubKey || !secKey) throw new Error("Missing decrypted keys");
 
-export async function executeTrade(user, match, decision) {
-  const publicKey = decrypt(user.bayse_pub_key);
-  const secretKey = decrypt(user.bayse_sec_key);
-
-  if (!publicKey || !secretKey) throw new Error("Missing API keys");
-
-  const { event, market, suggestedOutcome, signalSource, signalScore } = match;
-  const currency = user.currency || "USD";
-  const side     = "BUY";
-
-  const rawAmount = Number(decision.amount);
-  if (!Number.isFinite(rawAmount) || rawAmount <= 0) {
-    throw new Error(`Invalid trade amount: ${decision.amount}`);
-  }
-
-  const resolved  = resolveOutcomeId(market, suggestedOutcome);
-  const outcomeId = resolved?.outcomeId != null ? String(resolved.outcomeId) : null;
-  if (!outcomeId) throw new Error(`Could not resolve outcomeId for: ${suggestedOutcome}`);
-
-  const key = tradeKey(event.id, market.id, outcomeId);
-  if (ACTIVE_TRADES.has(key)) throw new Error("Duplicate trade blocked");
-  ACTIVE_TRADES.add(key);
+  const { event, market } = match;
+  const dedupeKey = `${event.id}:${market.id}`;
+  if (inFlight.has(dedupeKey)) throw new Error("Already in flight");
+  inFlight.add(dedupeKey);
 
   try {
-    const maxCap = Number.isFinite(Number(user.max_trade_amount))
-      ? Number(user.max_trade_amount)
-      : currency === "NGN" ? 500 : 5;
+    // Determine direction from highest-scoring signal
+    const scores  = [signals.crypto, signals.btc15m].filter(s => s?.score != null);
+    const leader  = scores.sort((a, b) => b.score - a.score)[0];
+    const direction = (leader?.direction === "UP") ? "YES" : "NO";
 
-    // Enforce minimums — NGN min is 100, USD min is 1
-    const amount = currency === "NGN"
-      ? Math.max(Math.min(Math.round(rawAmount), maxCap), 100)
-      : Math.max(Math.min(Number(rawAmount.toFixed(2)), maxCap), 1);
+    const { outcomeId, outcomeLabel } = resolveOutcomeId(market, direction);
+    if (!outcomeId) throw new Error(`Cannot resolve outcomeId for direction ${direction}`);
 
-    console.log(`[Executor] ${user.chat_id} | event:${event.id} | market:${market.id} | engine:${event.engine} | outcomeId:${outcomeId} | amount:${amount} | currency:${currency}`);
+    const threshold = parseFloat(user.threshold) || 0.6;
+    const max       = parseFloat(user.max_trade_amount) || 200;
+    const scale     = Math.min((signals.composite - threshold) / (1 - threshold), 1);
+    // Always at least ₦100, scale up based on signal strength
+    const amount    = Math.max(Math.round(max * (0.5 + 0.5 * scale)), 100);
 
-    const orderPayload = { side, outcomeId, amount, type: "MARKET", currency };
+    const orderBody = {
+      side:      "BUY",
+      outcomeId: String(outcomeId),
+      amount,
+      type:      "MARKET",
+      currency:  "NGN",
+    };
 
-    const order = await placeOrder(publicKey, secretKey, event.id, market.id, orderPayload);
+    console.log(`[Executor] ${user.chat_id} → ${event.title.slice(0, 40)} | ${direction} | ₦${amount} | outcomeId:${outcomeId}`);
 
-    const tradeRecord = {
+    const result = await placeOrder(pubKey, secKey, event.id, market.id, orderBody);
+    const order  = result?.order;
+
+    await insertTrade({
       chat_id:        String(user.chat_id),
       event_id:       event.id,
       market_id:      market.id,
-      event_title:    event.title || "Unknown",
-      outcome_label:  resolved.outcomeLabel || suggestedOutcome,
-      signal_source:  signalSource,
-      confidence:     signalScore,
-      side,
-      outcome:        suggestedOutcome,
+      event_title:    event.title,
+      outcome_label:  outcomeLabel,
+      signal_source:  leader?.label || "composite",
+      side:           "BUY",
+      outcome:        direction,
       amount,
-      currency,
-      expected_price: market.outcome1Price || 0.5,
-      status:         "open",
-    };
+      fill_price:     order?.price || market.outcome1Price || null,
+      bayse_order_id: order?.id    || null,
+    });
 
-    const result = await insertTrade(tradeRecord);
-    return { tradeId: result.id, order, tradeRecord };
+    return { order, amount, direction, outcomeLabel };
 
   } finally {
-    ACTIVE_TRADES.delete(key);
+    inFlight.delete(dedupeKey);
   }
 }
