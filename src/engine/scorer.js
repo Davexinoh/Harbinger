@@ -1,120 +1,66 @@
-import { runCryptoSignal }    from "../signals/cryptoSignal.js";
-import { runSportsSignal }    from "../signals/sportsSignal.js";
-import { runSentimentSignal } from "../signals/sentimentSignal.js";
-import { runBTCSignal }       from "../signals/btcSignal.js";
-import { getEvents }          from "../bayse/client.js";
+import { getEvents } from "../bayse/client.js";
 
-const WEIGHTS = {
-  crypto:    0.40,
-  sports:    0.25,
-  sentiment: 0.20,
-  btc15m:    0.15,
-};
+const CACHE_TTL = 4 * 60 * 1000;
+let eventCache = { data: null, ts: 0 };
 
-const CACHE_TTL  = 5 * 60 * 1000;
-const MIN_PRICE  = 0.25;
-const MAX_PRICE  = 0.75;
-
-let cache = { data: {}, ts: 0 };
-
-function neutral(source) {
-  return { source, score: 0.5, direction: null, error: "signal_crash" };
-}
-
-export async function runAllSignals() {
-  const [crypto, sports, sentiment, btc15m] = await Promise.all([
-    runCryptoSignal().catch(()    => neutral("crypto")),
-    runSportsSignal().catch(()    => neutral("sports")),
-    runSentimentSignal().catch(() => neutral("sentiment")),
-    runBTCSignal().catch(()       => neutral("btc_15m")),
-  ]);
-
-  const composite =
-    crypto.score    * WEIGHTS.crypto +
-    sports.score    * WEIGHTS.sports +
-    sentiment.score * WEIGHTS.sentiment +
-    btc15m.score    * WEIGHTS.btc15m;
-
-  return { crypto, sports, sentiment, btc15m, composite };
-}
-
-async function fetchEvents(pubKey) {
-  const now = Date.now();
-  if (cache.ts && now - cache.ts < CACHE_TTL) return cache.data;
-
-  const cats = ["sports", "crypto", "finance", null];
-
-  const res = await Promise.all(
-    cats.map(c =>
-      getEvents(pubKey, { category: c, status: "open", size: 50 }).catch(() => [])
-    )
-  );
-
-  const out = {};
-  cats.forEach((c, i) => { out[c || "general"] = res[i] || []; });
-
-  cache = { data: out, ts: now };
-  return out;
-}
-
+// Only CLOB markets, price between 5¢–95¢, status open, NGN supported
 function isTradeable(event, market) {
-  const eventEngine  = (event.engine  || "").toUpperCase();
-  const marketEngine = (market.engine || "").toUpperCase();
-  const eventType    = (event.type    || "").toUpperCase();
-
-  if (eventEngine === "AMM" || marketEngine === "AMM") return false;
-  if (eventType   === "COMBINED_MARKETS")              return false;
+  if ((event.engine  || "").toUpperCase() === "AMM")  return false;
+  if ((market.engine || "").toUpperCase() === "AMM")  return false;
   if (market.status !== "open")                        return false;
 
-  const p = market.outcome1Price ?? 0.5;
-  if (p < MIN_PRICE || p > MAX_PRICE)                  return false;
+  const supportedCurrencies = event.supportedCurrencies || [];
+  if (!supportedCurrencies.includes("NGN"))            return false;
+
+  const p = market.outcome1Price;
+  if (p == null || p < 0.05 || p > 0.95)              return false;
 
   return true;
 }
 
-export async function findMatchingMarket(signals, pubKey, excluded = new Set(), preferred = null) {
-  let events;
-  try {
-    events = await fetchEvents(pubKey);
-  } catch (err) {
-    console.error("[Scorer] fetchEvents failed:", err.message);
-    return null;
+export async function findMarket(pubKey, preferredCategory, excludedEventIds = new Set()) {
+  const now = Date.now();
+
+  // Refresh cache
+  if (!eventCache.data || now - eventCache.ts > CACHE_TTL) {
+    const [all, crypto, sports, finance] = await Promise.all([
+      getEvents(pubKey, { size: 100, currency: "NGN" }).catch(() => []),
+      getEvents(pubKey, { category: "crypto",  size: 50, currency: "NGN" }).catch(() => []),
+      getEvents(pubKey, { category: "sports",  size: 50, currency: "NGN" }).catch(() => []),
+      getEvents(pubKey, { category: "finance", size: 50, currency: "NGN" }).catch(() => []),
+    ]);
+
+    // Deduplicate by id
+    const seen = new Set();
+    const deduped = [...crypto, ...sports, ...finance, ...all].filter(e => {
+      if (seen.has(e.id)) return false;
+      seen.add(e.id);
+      return true;
+    });
+
+    eventCache = { data: deduped, ts: now };
+    console.log(`[Scorer] Cache refreshed — ${deduped.length} events`);
   }
 
-  const leader = [signals.crypto, signals.sports, signals.btc15m]
-    .filter(s => s?.score != null)
-    .sort((a, b) => b.score - a.score)[0];
+  const events = eventCache.data;
 
-  if (!leader) return null;
+  // Build candidate pool — preferred category first, then everything else
+  const preferred = preferredCategory && preferredCategory !== "all"
+    ? events.filter(e => e.category === preferredCategory)
+    : [];
+  const rest = events.filter(e => !preferred.includes(e));
+  const ordered = [...preferred, ...rest];
 
-  const direction = (leader.direction === "UP" || leader.direction === "bullish")
-    ? "YES" : "NO";
+  for (const event of ordered) {
+    if (excludedEventIds.has(event.id)) continue;
 
-  const allCats     = Object.keys(events);
-  const orderedCats = preferred
-    ? [preferred, ...allCats.filter(c => c !== preferred)]
-    : allCats;
+    const market = (event.markets || []).find(m => isTradeable(event, m));
+    if (!market) continue;
 
-  for (const cat of orderedCats) {
-    const pool = (events[cat] || []).filter(e => !excluded.has(e.id));
-
-    for (const event of pool) {
-      const market = (event.markets || []).find(m => isTradeable(event, m));
-      if (!market) continue;
-
-      console.log(`[Scorer] Selected: "${event.title}" | cat:${cat} | engine:${event.engine || "CLOB"} | p:${market.outcome1Price}`);
-
-      return {
-        event,
-        market,
-        suggestedOutcome: direction,
-        signalSource:     leader.source,
-        signalScore:      leader.score,
-        matchedKeywords:  [],
-      };
-    }
+    console.log(`[Scorer] Selected "${event.title}" | cat:${event.category} | engine:${event.engine} | p:${market.outcome1Price}`);
+    return { event, market };
   }
 
-  console.log("[Scorer] No tradeable CLOB market found this tick");
+  console.log("[Scorer] No tradeable market found");
   return null;
 }
