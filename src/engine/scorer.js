@@ -11,13 +11,12 @@ const WEIGHTS = {
   btc15m:    0.15,
 };
 
-const CACHE_TTL = 5 * 60 * 1000;
+const CACHE_TTL  = 5 * 60 * 1000;
+const MIN_PRICE  = 0.25;
+const MAX_PRICE  = 0.75;
+
 let cache = { data: {}, ts: 0 };
 
-const MIN_PRICE = 0.25;
-const MAX_PRICE = 0.75;
-
-// Neutral fallback for any signal that crashes unexpectedly
 function neutral(source) {
   return { source, score: 0.5, direction: null, error: "signal_crash" };
 }
@@ -52,31 +51,46 @@ async function fetchEvents(pubKey) {
   );
 
   const out = {};
-  cats.forEach((c, i) => {
-    out[c || "general"] = res[i] || [];
-  });
+  cats.forEach((c, i) => { out[c || "general"] = res[i] || []; });
 
   cache = { data: out, ts: now };
   return out;
 }
 
-function inRange(market) {
-  const p = market?.outcome1Price ?? 0.5;
-  return p >= MIN_PRICE && p <= MAX_PRICE;
+function isTradeable(event, market) {
+  // ONLY trade CLOB markets — AMM markets use different order mechanics
+  // and 400 with the current placeOrder body format every time
+  const eventEngine  = (event.engine  || "").toUpperCase();
+  const marketEngine = (market.engine || "").toUpperCase();
+  const eventType    = (event.type    || "").toUpperCase();
+
+  if (eventEngine === "AMM" || marketEngine === "AMM") return false;
+  if (eventType   === "COMBINED_MARKETS")              return false;
+  if (market.status !== "open")                        return false;
+
+  const p = market.outcome1Price ?? 0.5;
+  if (p < MIN_PRICE || p > MAX_PRICE)                  return false;
+
+  return true;
 }
 
 export async function findMatchingMarket(signals, pubKey, excluded = new Set(), preferred = null) {
-  const events = await fetchEvents(pubKey);
+  let events;
+  try {
+    events = await fetchEvents(pubKey);
+  } catch (err) {
+    console.error("[Scorer] fetchEvents failed:", err.message);
+    return null;
+  }
 
   const leader = [signals.crypto, signals.sports, signals.btc15m]
-    .filter(s => s.score != null)
+    .filter(s => s?.score != null)
     .sort((a, b) => b.score - a.score)[0];
 
   if (!leader) return null;
 
   const direction = (leader.direction === "UP" || leader.direction === "bullish")
-    ? "YES"
-    : "NO";
+    ? "YES" : "NO";
 
   const categories = preferred ? [preferred, "general"] : Object.keys(events);
 
@@ -84,8 +98,10 @@ export async function findMatchingMarket(signals, pubKey, excluded = new Set(), 
     const pool = (events[cat] || []).filter(e => !excluded.has(e.id));
 
     for (const event of pool) {
-      const market = event.markets?.find(m => m.status === "open");
-      if (!market || !inRange(market)) continue;
+      const market = (event.markets || []).find(m => isTradeable(event, m));
+      if (!market) continue;
+
+      console.log(`[Scorer] Selected: "${event.title}" | engine:${event.engine || "CLOB"} | p:${market.outcome1Price}`);
 
       return {
         event,
@@ -98,5 +114,6 @@ export async function findMatchingMarket(signals, pubKey, excluded = new Set(), 
     }
   }
 
+  console.log("[Scorer] No tradeable CLOB market found this tick");
   return null;
 }
