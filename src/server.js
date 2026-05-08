@@ -44,7 +44,17 @@ async function main() {
 
   // Now start polling cleanly
   bot.startPolling({ restart: false });
-  bot.on("polling_error", err => console.error("[Bot] Polling error:", err.message));
+  bot.on("polling_error", err => {
+    // 409 means another instance (e.g. Render) is already polling this token.
+    // Stop immediately — two pollers on the same token will never recover on their own.
+    if (err.message && err.message.includes("409")) {
+      console.error("[Bot] 409 Conflict — another bot instance is already polling this token. " +
+        "Shut down the duplicate instance, then restart this one.");
+      bot.stopPolling();
+      return;
+    }
+    console.error("[Bot] Polling error:", err.message);
+  });
 
   setBot(bot);
   registerCommands(bot);

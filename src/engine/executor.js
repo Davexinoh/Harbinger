@@ -24,7 +24,7 @@ export async function executeTrade(user, match, signals) {
     // Scale amount between 50 % and 100 % of max based on confidence above threshold
     const threshold = parseFloat(user.threshold)        || 0.6;
     const max       = parseFloat(user.max_trade_amount) || 200;
-    const scale     = Math.min((signals.composite - threshold) / (1 - threshold), 1);
+    const scale     = Math.max(0, Math.min((signals.composite - threshold) / (1 - threshold), 1));
     const amount    = Math.max(Math.round(max * (0.5 + 0.5 * scale)), 100);
 
     // Correct Bayse order body — side, outcome ("YES"/"NO"), amount, currency
