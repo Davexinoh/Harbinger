@@ -36,10 +36,10 @@ async function main() {
   const bot = new TelegramBot(TOKEN, { polling: false });
 
   try {
-    await bot.deleteWebhook({ drop_pending_updates: true });
+    await bot.deleteWebHook();
     console.log("[Bot] Webhook cleared");
   } catch (err) {
-    console.warn("[Bot] deleteWebhook failed (non-fatal):", err.message);
+    console.warn("[Bot] deleteWebHook failed (non-fatal):", err.message);
   }
 
   // Now start polling cleanly
