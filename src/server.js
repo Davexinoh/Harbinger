@@ -1,7 +1,3 @@
-// Kill any existing polling before starting
-const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-await fetch(`https://api.telegram.org/bot${TOKEN}/deleteWebhook?drop_pending_updates=true`);
-await new Promise(r => setTimeout(r, 3000)); // wait 3 seconds for Telegram to clear
 import "dotenv/config";
 import express     from "express";
 import fetch       from "node-fetch";
