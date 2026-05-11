@@ -81,3 +81,21 @@ export async function validateKeys(pubKey) {
     return { valid: false, error: err.message };
   }
 }
+
+export function resolveOutcomeId(market, direction) {
+  const wantYes = direction === "YES";
+  const bullish  = ["YES","UP","OVER","WIN","TRUE","HIGHER","TINUBU"];
+  const bearish  = ["NO","DOWN","UNDER","LOSS","FALSE","LOWER"];
+  const l1 = (market.outcome1Label || "").toUpperCase();
+  const l2 = (market.outcome2Label || "").toUpperCase();
+
+  if (wantYes) {
+    if (bullish.some(b => l1.includes(b))) return { outcomeId: market.outcome1Id, outcomeLabel: market.outcome1Label };
+    if (bullish.some(b => l2.includes(b))) return { outcomeId: market.outcome2Id, outcomeLabel: market.outcome2Label };
+    return { outcomeId: market.outcome1Id, outcomeLabel: market.outcome1Label || "YES" };
+  } else {
+    if (bearish.some(b => l1.includes(b))) return { outcomeId: market.outcome1Id, outcomeLabel: market.outcome1Label };
+    if (bearish.some(b => l2.includes(b))) return { outcomeId: market.outcome2Id, outcomeLabel: market.outcome2Label };
+    return { outcomeId: market.outcome2Id, outcomeLabel: market.outcome2Label || "NO" };
+  }
+}
