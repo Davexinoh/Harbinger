@@ -6,7 +6,7 @@ import { decrypt }         from "../utils/encryption.js";
 import { sendTradeExecuted, sendTradeFailed } from "../bot/alerts.js";
 
 const TICK_MS          = 60_000;
-const MIN_TRADE_GAP_MS = 20 * 60 * 1000;
+const MIN_TRADE_GAP_MS = 5 * 60 * 1000; // 5 min cooldown per user
 
 let timer       = null;
 let running     = false;
@@ -76,7 +76,7 @@ async function processUser(user, signals, pubKey) {
 
     const match = await findMarket(pubKey, preferred, excluded, true);
     if (!match) {
-      console.log(`[Engine] ${user.chat_id} — no market found (category: ${preferred || "all"})`);
+      console.log(`[Engine] ${user.chat_id} — no market (category: ${preferred || "all"})`);
       return;
     }
 
