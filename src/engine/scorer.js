@@ -60,8 +60,11 @@ export async function findMarket(
   const events = eventCache.data;
 
   let pool = preferred
-    ? events.filter(e => e._category === preferred || e.category === preferred)
-    : events;
+  ? events.filter(e =>
+      e._category?.toLowerCase() === preferred.toLowerCase() ||
+      e.category?.toLowerCase()  === preferred.toLowerCase()
+    )
+  : events;
 
   if (strictCategory && preferred && pool.length === 0) {
     console.log(`[Scorer] No events in "${preferred}" — not falling back`);
