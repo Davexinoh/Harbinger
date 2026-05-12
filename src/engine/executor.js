@@ -1,7 +1,8 @@
 import { placeOrder, resolveOutcomeId } from "../bayse/client.js";
-import { decrypt }    from "../utils/encryption.js";
+import { decrypt }     from "../utils/encryption.js";
 import { insertTrade } from "../db/database.js";
 
+// Per-user+market dedup — prevents same user hitting same market twice concurrently
 const inFlight = new Set();
 
 export async function executeTrade(user, match, signals) {
@@ -10,7 +11,9 @@ export async function executeTrade(user, match, signals) {
   if (!pubKey || !secKey) throw new Error("Missing keys");
 
   const { event, market } = match;
-  const dedupeKey = `${event.id}:${market.id}`;
+
+  // Key includes chat_id — different users can trade same market independently
+  const dedupeKey = `${user.chat_id}:${event.id}:${market.id}`;
   if (inFlight.has(dedupeKey)) throw new Error("Already in flight");
   inFlight.add(dedupeKey);
 
@@ -36,7 +39,7 @@ export async function executeTrade(user, match, signals) {
       currency:  "NGN",
     };
 
-    console.log(`[Executor] ${user.chat_id} → "${event.title.slice(0,40)}" | ${direction} | outcomeId:${outcomeId} | ₦${amount}`);
+    console.log(`[Executor] ${user.chat_id} → "${event.title.slice(0, 40)}" | ${direction} | outcomeId:${outcomeId} | ₦${amount}`);
 
     const result = await placeOrder(pubKey, secKey, event.id, market.id, orderBody);
 
@@ -54,7 +57,7 @@ export async function executeTrade(user, match, signals) {
       bayse_order_id: result?.order?.id    || null,
     });
 
-    return { result, amount, direction, outcomeLabel };
+    return { result, amount, direction, outcomeLabel: outcomeLabel || direction };
 
   } finally {
     inFlight.delete(dedupeKey);
