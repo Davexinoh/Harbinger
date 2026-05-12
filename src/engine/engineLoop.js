@@ -2,14 +2,18 @@ import { runAllSignals } from "../signals/index.js";
 import { findMarket }    from "./scorer.js";
 import { executeTrade }  from "./executor.js";
 import { getActiveUsers, getOpenEventIds, getUser } from "../db/database.js";
-import { decrypt } from "../utils/encryption.js";
-import { sendAlert } from "../bot/alerts.js";
+import { decrypt }       from "../utils/encryption.js";
+import { sendAlert }     from "../bot/alerts.js";
 
-const TICK_MS = 60_000;
-let timer = null, running = false, activeCount = 0;
+const TICK_MS          = 60_000;
+const MIN_TRADE_GAP_MS = 20 * 60 * 1000; // 20 min cooldown per user
 
-// Per-user processing lock — prevents concurrent ticks for same user
-const locks = new Map();
+let timer       = null;
+let running     = false;
+let activeCount = 0;
+
+const locks          = new Map(); // prevent concurrent ticks per user
+const lastTradeTimes = new Map(); // in-memory cooldown per user
 
 export function startEngine() {
   if (running) return;
@@ -34,18 +38,16 @@ async function tick() {
     activeCount = users.length;
     if (!users.length) return;
 
-    // Use first user's pub key for market fetching (public endpoint)
-    const pubKey   = decrypt(users[0].bayse_pub_key);
-    const signals  = await runAllSignals(pubKey);
+    const pubKey  = decrypt(users[0].bayse_pub_key)?.trim();
+    const signals = await runAllSignals(pubKey);
 
     console.log(`[Engine] composite=${signals.composite.toFixed(3)} | ${users.length} active users`);
 
     for (const user of users) {
-      if (!locks.get(user.chat_id)) {
-        locks.set(user.chat_id, true);
-        processUser(user, signals, pubKey)
-          .finally(() => locks.delete(user.chat_id));
-      }
+      if (locks.get(user.chat_id)) continue;
+      locks.set(user.chat_id, true);
+      processUser(user, signals, pubKey)
+        .finally(() => locks.delete(user.chat_id));
     }
   } catch (err) {
     console.error("[Engine] Tick error:", err.message);
@@ -54,19 +56,34 @@ async function tick() {
 
 async function processUser(user, signals, pubKey) {
   try {
-    // Re-fetch from DB — ensure engine_active is still true
     const fresh = await getUser(user.chat_id);
     if (!fresh?.engine_active) return;
 
     const threshold = parseFloat(fresh.threshold) || 0.6;
     if (signals.composite < threshold) return;
 
-    // Check what events this user already has open trades on
+    // Cooldown check — enforce 20 min between trades per user
+    const lastTrade = lastTradeTimes.get(user.chat_id) || 0;
+    if (Date.now() - lastTrade < MIN_TRADE_GAP_MS) {
+      console.log(`[Engine] ${user.chat_id} — cooldown active, skipping`);
+      return;
+    }
+
     const excluded = await getOpenEventIds(fresh.chat_id);
 
-    const preferred = fresh.preferred_category || "all";
-    const match     = await findMarket(pubKey, preferred, excluded);
-    if (!match) return;
+    // Strict category — only pass preferred, no fallback to all
+    const preferred = fresh.preferred_category && fresh.preferred_category !== "all"
+      ? fresh.preferred_category
+      : null;
+
+    const match = await findMarket(pubKey, preferred, excluded, true);
+    if (!match) {
+      console.log(`[Engine] ${user.chat_id} — no market found (category: ${preferred || "all"})`);
+      return;
+    }
+
+    // Set cooldown BEFORE executing to prevent race conditions
+    lastTradeTimes.set(user.chat_id, Date.now());
 
     const result = await executeTrade(fresh, match, signals);
 
