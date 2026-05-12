@@ -22,7 +22,7 @@ export async function initSchema() {
         username           TEXT,
         bayse_pub_key      TEXT,
         bayse_sec_key      TEXT,
-        threshold          REAL    NOT NULL DEFAULT 0.60,
+        threshold          REAL    NOT NULL DEFAULT 0.50,
         max_trade_amount   REAL    NOT NULL DEFAULT 200,
         preferred_category TEXT    NOT NULL DEFAULT 'all',
         engine_active      INTEGER NOT NULL DEFAULT 0,
@@ -49,6 +49,22 @@ export async function initSchema() {
         resolved_at    TIMESTAMPTZ
       );
     `);
+
+    // Live migrations
+    const migrations = [
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_category TEXT NOT NULL DEFAULT 'all'`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS max_trade_amount REAL NOT NULL DEFAULT 200`,
+      `ALTER TABLE trades ADD COLUMN IF NOT EXISTS outcome_label TEXT`,
+      `ALTER TABLE trades ADD COLUMN IF NOT EXISTS bayse_order_id TEXT`,
+      `ALTER TABLE trades ADD COLUMN IF NOT EXISTS fill_price REAL`,
+      // Update existing users threshold to 0.50 if still at old default 0.60
+      `UPDATE users SET threshold = 0.50 WHERE threshold = 0.60`,
+    ];
+
+    for (const m of migrations) {
+      try { await client.query(m); } catch (_) {}
+    }
+
     console.log("[DB] Schema ready");
   } finally {
     client.release();
@@ -66,7 +82,10 @@ export async function upsertUser(chatId, username) {
 }
 
 export async function getUser(chatId) {
-  const r = await getPool().query("SELECT * FROM users WHERE chat_id=$1", [String(chatId)]);
+  const r = await getPool().query(
+    "SELECT * FROM users WHERE chat_id=$1",
+    [String(chatId)]
+  );
   return r.rows[0] || null;
 }
 
@@ -83,7 +102,7 @@ export async function updateUser(chatId, fields) {
 export async function getActiveUsers() {
   const r = await getPool().query(`
     SELECT * FROM users
-    WHERE engine_active=1
+    WHERE engine_active = 1
       AND bayse_pub_key IS NOT NULL
       AND bayse_sec_key IS NOT NULL
   `);
@@ -100,8 +119,9 @@ export async function insertTrade(t) {
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
     RETURNING id
   `, [
-    t.chat_id, t.event_id, t.market_id, t.event_title, t.outcome_label,
-    t.signal_source, t.side || "BUY", t.outcome, t.amount,
+    t.chat_id, t.event_id, t.market_id, t.event_title,
+    t.outcome_label || null, t.signal_source || null,
+    t.side || "BUY", t.outcome, t.amount,
     t.fill_price || null, "open", t.bayse_order_id || null,
   ]);
   return r.rows[0];
