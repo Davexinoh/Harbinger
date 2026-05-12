@@ -73,8 +73,9 @@ async function processUser(user, signals, pubKey) {
     const preferred = fresh.preferred_category && fresh.preferred_category !== "all"
       ? fresh.preferred_category
       : null;
-
-    const match = await findMarket(pubKey, preferred, excluded, true);
+// In processUser, update the findMarket call:
+const match = await findMarket(pubKey, preferred, excluded, true, signals.direction);
+    
     if (!match) {
       console.log(`[Engine] ${user.chat_id} — no market (category: ${preferred || "all"})`);
       return;
