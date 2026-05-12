@@ -1,9 +1,8 @@
 import { getEvents } from "../bayse/client.js";
 
-const CACHE_TTL  = 3 * 60 * 1000; // 3 min cache
-const MIN_PRICE  = 0.20; // tightened from 0.05
-const MAX_PRICE  = 0.75; // tightened from 0.95
-const MIN_ORDERS = 15;   // minimum liquidity
+const CACHE_TTL = 3 * 60 * 1000;
+const MIN_PRICE = 0.10;
+const MAX_PRICE = 0.90;
 
 let eventCache = { data: null, ts: 0 };
 
@@ -13,23 +12,26 @@ function isTradeable(event, market) {
   if (market.status !== "open")                       return false;
   const p = market.outcome1Price;
   if (p == null || p < MIN_PRICE || p > MAX_PRICE)   return false;
-  if ((event.totalOrders || 0) < MIN_ORDERS)          return false;
   return true;
 }
 
-// Edge score — how far is market price from 50/50?
-// Higher edge = market has a clear lean we can trade against or with
+// Edge = how mispriced is this market relative to our signal direction
+// Signal says UP + market price is low (e.g. 25¢) = high edge
+// Signal says UP + market price is high (e.g. 80¢) = low edge
 function edgeScore(market, signalDirection) {
   const p   = market.outcome1Price || 0.5;
-  const yes = signalDirection === "YES" || signalDirection === "UP";
-
-  // If signal says YES and market price is low (e.g. 30¢), high edge — market undervalues YES
-  // If signal says YES and market price is high (e.g. 70¢), low edge — market already priced in
+  const yes = signalDirection === "UP" || signalDirection === "YES";
   const edge = yes ? (0.5 - p) : (p - 0.5);
-  return Math.max(0, edge); // only positive edge
+  return Math.max(0, edge);
 }
 
-export async function findMarket(pubKey, preferred = null, excluded = new Set(), strictCategory = false, signalDirection = "UP") {
+export async function findMarket(
+  pubKey,
+  preferred      = null,
+  excluded       = new Set(),
+  strictCategory = false,
+  signalDirection = "UP"
+) {
   const now = Date.now();
 
   if (!eventCache.data || now - eventCache.ts > CACHE_TTL) {
@@ -57,7 +59,6 @@ export async function findMarket(pubKey, preferred = null, excluded = new Set(),
 
   const events = eventCache.data;
 
-  // Build pool
   let pool = preferred
     ? events.filter(e => e._category === preferred || e.category === preferred)
     : events;
@@ -71,14 +72,13 @@ export async function findMarket(pubKey, preferred = null, excluded = new Set(),
     pool = events;
   }
 
-  // Score all candidates by edge — pick highest edge market
+  // Score all candidates by edge — pick best
   const candidates = [];
 
   for (const event of pool) {
     if (excluded.has(event.id)) continue;
     const market = (event.markets || []).find(m => isTradeable(event, m));
     if (!market) continue;
-
     const edge = edgeScore(market, signalDirection);
     candidates.push({ event, market, edge });
   }
@@ -88,7 +88,7 @@ export async function findMarket(pubKey, preferred = null, excluded = new Set(),
     return null;
   }
 
-  // Sort by edge descending — highest edge first
+  // Sort by edge — best opportunity first
   candidates.sort((a, b) => b.edge - a.edge);
   const best = candidates[0];
 
@@ -96,8 +96,7 @@ export async function findMarket(pubKey, preferred = null, excluded = new Set(),
     `[Scorer] Selected "${best.event.title}" | ` +
     `cat:${best.event._category} | ` +
     `p:${best.market.outcome1Price} | ` +
-    `edge:${best.edge.toFixed(3)} | ` +
-    `orders:${best.event.totalOrders || 0}`
+    `edge:${best.edge.toFixed(3)}`
   );
 
   return { event: best.event, market: best.market, edge: best.edge };
