@@ -15,9 +15,6 @@ function isTradeable(event, market) {
   return true;
 }
 
-// Edge = how mispriced is this market relative to our signal direction
-// Signal says UP + market price is low (e.g. 25¢) = high edge
-// Signal says UP + market price is high (e.g. 80¢) = low edge
 function edgeScore(market, signalDirection) {
   const p   = market.outcome1Price || 0.5;
   const yes = signalDirection === "UP" || signalDirection === "YES";
@@ -27,9 +24,9 @@ function edgeScore(market, signalDirection) {
 
 export async function findMarket(
   pubKey,
-  preferred      = null,
-  excluded       = new Set(),
-  strictCategory = false,
+  preferred       = null,
+  excluded        = new Set(),
+  strictCategory  = false,
   signalDirection = "UP"
 ) {
   const now = Date.now();
@@ -59,12 +56,13 @@ export async function findMarket(
 
   const events = eventCache.data;
 
+  // Case-insensitive category match
   let pool = preferred
-  ? events.filter(e =>
-      e._category?.toLowerCase() === preferred.toLowerCase() ||
-      e.category?.toLowerCase()  === preferred.toLowerCase()
-    )
-  : events;
+    ? events.filter(e =>
+        e._category?.toLowerCase() === preferred.toLowerCase() ||
+        e.category?.toLowerCase()  === preferred.toLowerCase()
+      )
+    : events;
 
   if (strictCategory && preferred && pool.length === 0) {
     console.log(`[Scorer] No events in "${preferred}" — not falling back`);
@@ -75,7 +73,7 @@ export async function findMarket(
     pool = events;
   }
 
-  // Score all candidates by edge — pick best
+  // Score all candidates by edge
   const candidates = [];
 
   for (const event of pool) {
@@ -91,9 +89,10 @@ export async function findMarket(
     return null;
   }
 
-  // Sort by edge — best opportunity first
+  // Prefer markets with real edge — fall back to all if none qualify
   candidates.sort((a, b) => b.edge - a.edge);
-  const best = candidates[0];
+  const valid = candidates.filter(c => c.edge > 0.02);
+  const best  = valid.length ? valid[0] : candidates[0];
 
   console.log(
     `[Scorer] Selected "${best.event.title}" | ` +
