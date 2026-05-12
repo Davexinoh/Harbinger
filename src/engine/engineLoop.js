@@ -1,19 +1,19 @@
-import { runAllSignals } from "../signals/index.js";
-import { findMarket }    from "./scorer.js";
-import { executeTrade }  from "./executor.js";
+import { runAllSignals }   from "../signals/index.js";
+import { findMarket }      from "./scorer.js";
+import { executeTrade }    from "./executor.js";
 import { getActiveUsers, getOpenEventIds, getUser } from "../db/database.js";
-import { decrypt }       from "../utils/encryption.js";
-import { sendAlert }     from "../bot/alerts.js";
+import { decrypt }         from "../utils/encryption.js";
+import { sendTradeExecuted, sendTradeFailed } from "../bot/alerts.js";
 
 const TICK_MS          = 60_000;
-const MIN_TRADE_GAP_MS = 20 * 60 * 1000; // 20 min cooldown per user
+const MIN_TRADE_GAP_MS = 20 * 60 * 1000;
 
 let timer       = null;
 let running     = false;
 let activeCount = 0;
 
-const locks          = new Map(); // prevent concurrent ticks per user
-const lastTradeTimes = new Map(); // in-memory cooldown per user
+const locks          = new Map();
+const lastTradeTimes = new Map();
 
 export function startEngine() {
   if (running) return;
@@ -62,7 +62,6 @@ async function processUser(user, signals, pubKey) {
     const threshold = parseFloat(fresh.threshold) || 0.6;
     if (signals.composite < threshold) return;
 
-    // Cooldown check — enforce 20 min between trades per user
     const lastTrade = lastTradeTimes.get(user.chat_id) || 0;
     if (Date.now() - lastTrade < MIN_TRADE_GAP_MS) {
       console.log(`[Engine] ${user.chat_id} — cooldown active, skipping`);
@@ -71,7 +70,6 @@ async function processUser(user, signals, pubKey) {
 
     const excluded = await getOpenEventIds(fresh.chat_id);
 
-    // Strict category — only pass preferred, no fallback to all
     const preferred = fresh.preferred_category && fresh.preferred_category !== "all"
       ? fresh.preferred_category
       : null;
@@ -82,23 +80,23 @@ async function processUser(user, signals, pubKey) {
       return;
     }
 
-    // Set cooldown BEFORE executing to prevent race conditions
     lastTradeTimes.set(user.chat_id, Date.now());
 
     const result = await executeTrade(fresh, match, signals);
 
-    await sendAlert(fresh.chat_id,
-      `✅ Trade Executed\n\n` +
-      `${match.event.title}\n` +
-      `${result.direction} | ₦${result.amount}\n` +
-      `Fill: ${result.outcomeLabel}\n\n` +
-      `Composite: ${(signals.composite * 100).toFixed(0)}%`
-    );
+    await sendTradeExecuted(fresh.chat_id, {
+      title:        match.event.title,
+      direction:    result.direction,
+      amount:       result.amount,
+      outcomeLabel: result.outcomeLabel,
+      composite:    signals.composite,
+    });
 
   } catch (err) {
     console.error(`[Engine] ${user.chat_id} failed:`, err.message);
-    await sendAlert(user.chat_id,
-      `⚠️ Trade Failed\n\nConfidence: ${(signals.composite * 100).toFixed(0)}%\nError: ${err.message}`
-    ).catch(() => {});
+    await sendTradeFailed(user.chat_id, {
+      composite: signals.composite,
+      error:     err.message,
+    }).catch(() => {});
   }
 }
