@@ -5,7 +5,7 @@ import { getActiveUsers, getOpenEventIds, getUser } from "../db/database.js";
 import { decrypt }         from "../utils/encryption.js";
 import { sendTradeExecuted, sendTradeFailed } from "../bot/alerts.js";
 
-const TICK_MS          = 60_000;
+const TICK_MS = 30_000; // 30s instead of 60s — sniper speed
 const MIN_TRADE_GAP_MS = 5 * 60 * 1000; // 5 min cooldown per user
 
 let timer       = null;
