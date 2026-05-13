@@ -1,6 +1,6 @@
 import { getPool, updateTrade, getOpenTrades } from "../db/database.js";
-import { getEventById }    from "../bayse/client.js";
-import { decrypt }         from "../utils/encryption.js";
+import { getEventById }     from "../bayse/client.js";
+import { decrypt }          from "../utils/encryption.js";
 import { sendTradeSettled } from "../bot/alerts.js";
 
 let timer = null;
@@ -13,9 +13,9 @@ export function startResolver() {
     if (r.rowCount > 0) console.log(`[Resolver] Marked ${r.rowCount} stale trades`);
   }).catch(() => {});
 
-  timer = setInterval(resolve, 2 * 60 * 1000);
+  timer = setInterval(resolve, 60 * 1000); // check every 1 min
   console.log("[Resolver] Started");
-  setTimeout(resolve, 30_000);
+  setTimeout(resolve, 20_000);
 }
 
 export function stopResolver() {
@@ -26,8 +26,6 @@ async function resolve() {
   try {
     const trades = await getOpenTrades();
     if (!trades.length) return;
-
-    console.log(`[Resolver] Checking ${trades.length} open trade(s)`);
 
     for (const trade of trades) {
       try {
@@ -40,24 +38,51 @@ async function resolve() {
         if (!market) continue;
 
         const status  = (market.status || event.status || "").toLowerCase();
-        const settled = ["resolved","settled","closed","completed"].some(s => status.includes(s));
+        const settled = ["resolved", "settled", "closed", "completed"].some(s => status.includes(s));
         if (!settled) continue;
 
+        // Must have a winner to settle — don't guess
         const winnerId = market.winningOutcomeId || market.resolvedOutcomeId;
-        let pnl = 0;
-
-        if (winnerId) {
-          const userBoughtOutcome1 =
-            (trade.outcome === "YES" && (market.outcome1Label || "").toUpperCase().includes("YES")) ||
-            (trade.outcome === "NO"  && (market.outcome1Label || "").toUpperCase().includes("NO"));
-
-          const userOutcomeId = userBoughtOutcome1 ? market.outcome1Id : market.outcome2Id;
-          const won           = userOutcomeId === winnerId;
-          const fillPrice     = trade.fill_price || 0.5;
-          pnl = won
-            ? parseFloat((trade.amount * (1 - fillPrice) / fillPrice).toFixed(2))
-            : -trade.amount;
+        if (!winnerId) {
+          console.log(`[Resolver] Trade ${trade.id} — settled but no winner yet, skipping`);
+          continue;
         }
+
+        // Match our outcome to the winning outcome
+        // Check both label match and direct outcomeId match
+        const o1Wins = winnerId === market.outcome1Id;
+        const o2Wins = winnerId === market.outcome2Id;
+
+        // Determine which outcomeId user bought
+        // We stored the outcomeId in bayse_order_id? No — we stored outcome label (YES/NO)
+        // So match by label
+        const o1Label = (market.outcome1Label || "").toUpperCase();
+        const o2Label = (market.outcome2Label || "").toUpperCase();
+        const userLabel = (trade.outcome_label || trade.outcome || "").toUpperCase();
+
+        let won = null;
+        if (o1Wins) {
+          won = userLabel === o1Label ||
+            (["YES","UP"].includes(userLabel) && ["YES","UP"].includes(o1Label));
+        } else if (o2Wins) {
+          won = userLabel === o2Label ||
+            (["YES","UP"].includes(userLabel) && ["YES","UP"].includes(o2Label));
+        }
+
+        if (won === null) {
+          console.log(`[Resolver] Trade ${trade.id} — cannot determine win/loss, skipping`);
+          continue;
+        }
+
+        // P&L calculation
+        // On Bayse CLOB: if you buy YES at price p with amount A
+        // Win: you get back A / p (your stake + profit)
+        // Profit = A * (1-p) / p
+        // Loss: you lose your stake A
+        const fillPrice = trade.fill_price || 0.5;
+        const pnl = won
+          ? parseFloat((trade.amount * (1 - fillPrice) / fillPrice).toFixed(2))
+          : parseFloat((-trade.amount).toFixed(2));
 
         await updateTrade(trade.id, {
           status:      "resolved",
@@ -72,7 +97,7 @@ async function resolve() {
           pnl,
         });
 
-        console.log(`[Resolver] Trade ${trade.id} settled | pnl:${pnl}`);
+        console.log(`[Resolver] Trade ${trade.id} | ${won ? "WON" : "LOST"} | pnl:${pnl}`);
 
       } catch (err) {
         console.error(`[Resolver] Trade ${trade.id}:`, err.message);
