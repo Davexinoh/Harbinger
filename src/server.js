@@ -19,9 +19,10 @@ if (!process.env.ENCRYPTION_KEY) { console.error("Missing ENCRYPTION_KEY");     
 
 const bot = new TelegramBot(TOKEN, { polling: false });
 
-// Clear webhook + any existing polling before starting
-await bot.deleteWebhook({ drop_pending_updates: true });
-await new Promise(r => setTimeout(r, 2000));
+// Clear webhook (correct way for this library)
+await bot.setWebHook('');
+
+// Start polling cleanly
 bot.startPolling();
 
 setBot(bot);
