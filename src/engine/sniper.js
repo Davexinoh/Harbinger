@@ -35,10 +35,6 @@ const SNIPER_KEYWORDS = [
 
 function isSniperMarket(event) {
   const t = (event.title || "").toLowerCase();
-  return SNIPER_KEYWORDS.some(kw => t.includes(kw));
-}
-function isSniperMarket(event) {
-  const t = (event.title || "").toLowerCase();
 
   const isBTC =
     t.includes("bitcoin") ||
@@ -52,7 +48,6 @@ function isSniperMarket(event) {
 
   return isBTC && isShortTerm;
 }
-
 
 
 async function fetchSniperMarkets(pubKey) {
