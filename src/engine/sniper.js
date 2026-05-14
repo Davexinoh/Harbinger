@@ -27,10 +27,6 @@ let running = false;
 const SNIPER_KEYWORDS = [
   "bitcoin up or down",
   "btc up or down",
-  "ethereum up or down",
-  "eth up or down",
-  "solana up or down",
-  "sol up or down",
   "15 minute",
   "15min",
   "next hour",
