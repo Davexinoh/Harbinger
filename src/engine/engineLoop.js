@@ -1,12 +1,12 @@
-import { runAllSignals }   from "../signals/index.js";
-import { findMarket }      from "./scorer.js";
-import { executeTrade }    from "./executor.js";
+import { runAllSignals }             from "../signals/index.js";
+import { findMarket }                from "./scorer.js";
+import { executeTrade }              from "./executor.js";
 import { getActiveUsers, getOpenEventIds, getUser } from "../db/database.js";
-import { decrypt }         from "../utils/encryption.js";
+import { decrypt }                   from "../utils/encryption.js";
 import { sendTradeExecuted, sendTradeFailed } from "../bot/alerts.js";
 
-const TICK_MS = 30_000; // 30s instead of 60s — sniper speed
-const MIN_TRADE_GAP_MS = 5 * 60 * 1000; // 5 min cooldown per user
+const TICK_MS          = 60_000;
+const MIN_TRADE_GAP_MS = 5 * 60 * 1000;
 
 let timer       = null;
 let running     = false;
@@ -31,6 +31,9 @@ export function stopEngine() {
 export function getEngineStatus() {
   return { running, activeUsers: activeCount };
 }
+
+// Export so sniper can update cooldown
+export { lastTradeTimes };
 
 async function tick() {
   try {
@@ -59,23 +62,21 @@ async function processUser(user, signals, pubKey) {
     const fresh = await getUser(user.chat_id);
     if (!fresh?.engine_active) return;
 
-    const threshold = parseFloat(fresh.threshold) || 0.6;
+    const threshold = parseFloat(fresh.threshold) || 0.5;
     if (signals.composite < threshold) return;
 
     const lastTrade = lastTradeTimes.get(user.chat_id) || 0;
     if (Date.now() - lastTrade < MIN_TRADE_GAP_MS) {
-      console.log(`[Engine] ${user.chat_id} — cooldown active, skipping`);
+      console.log(`[Engine] ${user.chat_id} — cooldown active`);
       return;
     }
 
-    const excluded = await getOpenEventIds(fresh.chat_id);
-
+    const excluded  = await getOpenEventIds(fresh.chat_id);
     const preferred = fresh.preferred_category && fresh.preferred_category !== "all"
       ? fresh.preferred_category
       : null;
-// In processUser, update the findMarket call:
-const match = await findMarket(pubKey, preferred, excluded, true, signals.direction);
-    
+
+    const match = await findMarket(pubKey, preferred, excluded, true, signals.direction);
     if (!match) {
       console.log(`[Engine] ${user.chat_id} — no market (category: ${preferred || "all"})`);
       return;
