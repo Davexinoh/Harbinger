@@ -1,8 +1,9 @@
 import { getEvents } from "../bayse/client.js";
 
-const CACHE_TTL = 2 * 60 * 1000; // 2 min — faster refresh for sniper
-const MIN_PRICE = 0.10;
-const MAX_PRICE = 0.90;
+const CACHE_TTL  = 2 * 60 * 1000;
+const MIN_PRICE  = 0.10;
+const MAX_PRICE  = 0.90;
+const MIN_EDGE   = 0.05; // minimum edge to enter — no overpriced trades
 
 let eventCache = { data: null, ts: 0 };
 
@@ -15,35 +16,25 @@ function isTradeable(event, market) {
   return true;
 }
 
-// Edge = distance from 0.5 — we trade TOWARD the market lean
-// If outcome1Price = 0.3 → market says NO is likely (70¢)
-// If outcome1Price = 0.7 → market says YES is likely (70¢)
-// Best edge = pick the CHEAP side that our signal agrees with
+// Pick the side with real edge based on signal direction
+// Signal says UP + market prices YES at 30¢ = high edge (market undervalues UP)
+// Signal says UP + market prices YES at 85¢ = negative edge (market overvalues UP)
 function getBestSide(market, signalDirection) {
-  const p1 = market.outcome1Price || 0.5;
-  const p2 = 1 - p1;
-
+  const p1     = market.outcome1Price || 0.5;
+  const p2     = 1 - p1;
   const signalUp = signalDirection === "UP" || signalDirection === "YES";
 
-  // Edge for buying outcome1 (YES side)
-  const edge1 = signalUp  ? (0.5 - p1) : (p1 - 0.5);
-  // Edge for buying outcome2 (NO side)
-  const edge2 = !signalUp ? (0.5 - p2) : (p2 - 0.5);
+  const edge1 = signalUp  ? (0.5 - p1) : (p1 - 0.5); // edge buying outcome1
+  const edge2 = !signalUp ? (0.5 - p2) : (p2 - 0.5); // edge buying outcome2
 
   if (Math.max(edge1, 0) >= Math.max(edge2, 0)) {
-    return {
-      edge:      Math.max(edge1, 0),
-      direction: "YES",
-    };
+    return { edge: Math.max(edge1, 0), direction: "YES" };
   } else {
-    return {
-      edge:      Math.max(edge2, 0),
-      direction: "NO",
-    };
+    return { edge: Math.max(edge2, 0), direction: "NO" };
   }
 }
 
-// Check if event is a short-term BTC market — sniper priority
+// BTC short-term markets get sniper priority bonus
 function isBTCSniper(event) {
   const t = (event.title || "").toLowerCase();
   return (t.includes("bitcoin") || t.includes("btc")) &&
@@ -84,6 +75,7 @@ export async function findMarket(
 
   const events = eventCache.data;
 
+  // Case-insensitive category filter
   let pool = preferred
     ? events.filter(e =>
         e._category?.toLowerCase() === preferred.toLowerCase() ||
@@ -100,6 +92,7 @@ export async function findMarket(
     pool = events;
   }
 
+  // Score all candidates
   const candidates = [];
 
   for (const event of pool) {
@@ -108,9 +101,16 @@ export async function findMarket(
     if (!market) continue;
 
     const { edge, direction } = getBestSide(market, signalDirection);
-    const sniper = isBTCSniper(event) ? 0.15 : 0; // bonus for BTC short-term markets
+    const sniperBonus = isBTCSniper(event) ? 0.10 : 0;
 
-    candidates.push({ event, market, edge: edge + sniper, direction, isSniper: sniper > 0 });
+    candidates.push({
+      event,
+      market,
+      edge:      edge + sniperBonus,
+      rawEdge:   edge,
+      direction,
+      isSniper:  sniperBonus > 0,
+    });
   }
 
   if (!candidates.length) {
@@ -118,14 +118,28 @@ export async function findMarket(
     return null;
   }
 
+  // Sort by edge
   candidates.sort((a, b) => b.edge - a.edge);
-  const best = candidates[0];
+
+  // Hard filter — only enter if real edge exists
+  // No positive edge = market is fairly or over-priced for our signal = skip
+  const valid = candidates.filter(c => c.rawEdge >= MIN_EDGE);
+
+  if (!valid.length) {
+    console.log(
+      `[Scorer] No positive-edge market found — best was ` +
+      `"${candidates[0].event.title}" rawEdge:${candidates[0].rawEdge.toFixed(3)} — skipping`
+    );
+    return null;
+  }
+
+  const best = valid[0];
 
   console.log(
     `[Scorer] Selected "${best.event.title}" | ` +
     `cat:${best.event._category} | ` +
     `p:${best.market.outcome1Price} | ` +
-    `edge:${best.edge.toFixed(3)} | ` +
+    `edge:${best.rawEdge.toFixed(3)} | ` +
     `dir:${best.direction}` +
     (best.isSniper ? " | 🎯 SNIPER" : "")
   );
@@ -134,6 +148,6 @@ export async function findMarket(
     event:     best.event,
     market:    best.market,
     edge:      best.edge,
-    direction: best.direction, // actual trade direction from edge scoring
+    direction: best.direction,
   };
 }
