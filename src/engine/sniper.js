@@ -37,12 +37,23 @@ function isSniperMarket(event) {
   const t = (event.title || "").toLowerCase();
   return SNIPER_KEYWORDS.some(kw => t.includes(kw));
 }
+function isSniperMarket(event) {
+  const t = (event.title || "").toLowerCase();
 
-function isFreshMarket(market) {
-  // Fresh = price hasn't moved far from 50¢ yet
-  const p = market.outcome1Price || 0.5;
-  return p >= (1 - SNIPER_MAX_PRICE) && p <= SNIPER_MAX_PRICE;
+  const isBTC =
+    t.includes("bitcoin") ||
+    t.includes("btc");
+
+  const isShortTerm =
+    t.includes("15 minute") ||
+    t.includes("15min") ||
+    t.includes("next hour") ||
+    t.includes("1 hour");
+
+  return isBTC && isShortTerm;
 }
+
+
 
 async function fetchSniperMarkets(pubKey) {
   try {
