@@ -1,25 +1,20 @@
-// Harbinger Sniper Engine (Hardened)
-// BTC-only, fresh-market sniper with signal gating + safe execution
-
 import fetch from "node-fetch";
 import { executeTrade } from "./executor.js";
-import { getActiveUsers, getOpenEventIds, getUser, disableUser } from "../db/database.js";
+import { getActiveUsers, getOpenEventIds, getUser } from "../db/database.js";
 import { decrypt } from "../utils/encryption.js";
 import { sendTradeExecuted, sendTradeFailed } from "../bot/alerts.js";
 import { runAllSignals } from "../signals/index.js";
 import { lastTradeTimes } from "./engineLoop.js";
 
-const SNIPER_TICK_MS   = 15_000;
+const SNIPER_TICK_MS = 15_000;
 const MIN_TRADE_GAP_MS = 5 * 60 * 1000;
 
-const SNIPER_MAX_PRICE = 0.55; // ≤55¢ = early market
-const SNIPER_MIN_SCORE = 0.52; // BTC signal threshold
-
-const ONLY_BTC = true;
+const SNIPER_MAX_PRICE = 0.55;
+const SNIPER_MIN_SCORE = 0.52;
 
 const sniped = new Set();
 
-let timer   = null;
+let timer = null;
 let running = false;
 
 /* ---------------- HELPERS ---------------- */
@@ -34,19 +29,16 @@ function isBTCEvent(event) {
   return t.includes("bitcoin") || t.includes("btc");
 }
 
-function isShortTerm(event) {
+function isSniperEvent(event) {
   const t = (event.title || "").toLowerCase();
-  return (
+
+  const isShortTerm =
     t.includes("15 minute") ||
     t.includes("15min") ||
-    t.includes("next hour") ||
-    t.includes("1 hour")
-  );
-}
+    t.includes("1 hour") ||
+    t.includes("next hour");
 
-function isSniperEvent(event) {
-  if (ONLY_BTC && !isBTCEvent(event)) return false;
-  return isShortTerm(event);
+  return isBTCEvent(event) && isShortTerm;
 }
 
 /* ---------------- FETCH ---------------- */
@@ -62,15 +54,13 @@ async function fetchSniperMarkets(pubKey) {
 
     const data = await res.json();
 
-    return (data?.events || []).filter(e => {
-      return (
-        e.engine !== "AMM" &&
-        isSniperEvent(e) &&
-        e.markets?.some(m => m.status === "open")
-      );
-    });
+    return (data?.events || []).filter(e =>
+      e.engine !== "AMM" &&
+      isSniperEvent(e) &&
+      e.markets?.some(m => m.status === "open")
+    );
 
-  } catch {
+  } catch (err) {
     return [];
   }
 }
@@ -92,6 +82,8 @@ export function stopSniper() {
   running = false;
 }
 
+/* ---------------- LOOP ---------------- */
+
 async function sniperTick() {
   try {
     const users = await getActiveUsers();
@@ -106,29 +98,23 @@ async function sniperTick() {
     const targets = [];
 
     for (const event of events) {
-      const market = event.markets.find(m => {
-        return (
-          m.status === "open" &&
-          isFreshMarket(m) &&
-          !sniped.has(m.id)
-        );
-      });
+      const market = event.markets.find(m =>
+        m.status === "open" &&
+        isFreshMarket(m) &&
+        !sniped.has(m.id)
+      );
 
       if (market) targets.push({ event, market });
     }
 
     if (!targets.length) return;
 
-    console.log(`[Sniper] Found ${targets.length} fresh BTC market(s)`);
-
-    /* -------- SIGNAL GATING -------- */
-
-    const signals  = await runAllSignals(pubKey);
+    const signals = await runAllSignals(pubKey);
     const btcScore = signals.btc15m?.score || 0.5;
-    const btcDir   = signals.btc15m?.direction;
+    const btcDir = signals.btc15m?.direction;
 
     if (btcScore < SNIPER_MIN_SCORE || !btcDir) {
-      console.log(`[Sniper] Signal weak (${btcScore.toFixed(2)}) — skip`);
+      console.log(`[Sniper] Signal weak (${btcScore.toFixed(2)})`);
       return;
     }
 
@@ -136,7 +122,7 @@ async function sniperTick() {
       `[Sniper] 🎯 firing | btc15m:${btcScore.toFixed(2)} ${btcDir}`
     );
 
-    /* -------- EXECUTION (PARALLEL USERS) -------- */
+    /* ---------------- EXECUTION ---------------- */
 
     await Promise.all(users.map(async (user) => {
       try {
@@ -151,30 +137,25 @@ async function sniperTick() {
         for (const { event, market } of targets) {
           if (excluded.has(event.id)) continue;
 
-          try {
-            const direction = btcDir === "UP" ? "YES" : "NO";
+          const direction = btcDir === "UP" ? "YES" : "NO";
 
-            const match = {
+          try {
+            const result = await executeTrade(fresh, {
               event,
               market,
               direction,
               edge: 0.5 - (market.outcome1Price ?? 0.5),
-            };
-
-            const result = await executeTrade(fresh, match, {
-              ...signals,
-              composite: btcScore,
             });
 
             sniped.add(market.id);
             lastTradeTimes.set(user.chat_id, Date.now());
 
             await sendTradeExecuted(fresh.chat_id, {
-              title:        `🎯 BTC SNIPE: ${event.title}`,
-              direction:    result.direction,
-              amount:       result.amount,
+              title: `🎯 BTC SNIPE: ${event.title}`,
+              direction: result.direction,
+              amount: result.amount,
               outcomeLabel: result.outcomeLabel,
-              composite:    btcScore,
+              composite: btcScore,
             });
 
             console.log(
@@ -182,30 +163,19 @@ async function sniperTick() {
             );
 
           } catch (err) {
-            const msg = err.message || "";
-
-            // Kill bad API keys immediately
-            if (msg.includes("401")) {
-              console.error(`[Sniper] ${user.chat_id} invalid API key — disabling`);
-              await disableUser(user.chat_id);
-              return;
-            }
-
-            console.error(`[Sniper] ${user.chat_id} failed:`, msg);
+            console.error(`[Sniper] ${user.chat_id} failed:`, err.message);
 
             await sendTradeFailed(user.chat_id, {
               composite: btcScore,
-              error: `Sniper: ${msg}`,
+              error: `Sniper: ${err.message}`,
             }).catch(() => {});
           }
         }
 
       } catch (err) {
-        console.error(`[Sniper] user ${user.chat_id} error:`, err.message);
+        console.error(`[Sniper] user error ${user.chat_id}:`, err.message);
       }
     }));
-
-    /* -------- MEMORY CLEANUP -------- */
 
     if (sniped.size > 200) sniped.clear();
 
