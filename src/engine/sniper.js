@@ -1,5 +1,5 @@
 // Harbinger Sniper Engine
-// Watches ONLY short-term BTC/ETH/SOL 15-min markets on Bayse
+// Watches ONLY short-term BTC 15-min markets on Bayse
 // Fires the moment a NEW market opens — before crowd prices it
 // Target: entry at 30¢-50¢ on fresh markets (highest payout potential)
 // Runs every 15 seconds independently of the main engine
