@@ -9,13 +9,13 @@ export async function signedRequest(pubKey, secKey, method, path, body = null) {
   const bodyHash  = bodyStr
     ? crypto.createHash("sha256").update(bodyStr, "utf8").digest("hex")
     : "";
-  const payload   = ${timestamp}.${method}.${path}.${bodyHash};
+  const payload   = `${timestamp}.${method}.${path}.${bodyHash}`;
   const signature = crypto
     .createHmac("sha256", secKey)
     .update(payload, "utf8")
     .digest("base64");
 
-  const res = await fetch(${BASE}${path}, {
+  const res = await fetch(`${BASE}${path}`, {
     method,
     headers: {
       "X-Public-Key": pubKey,
@@ -27,32 +27,32 @@ export async function signedRequest(pubKey, secKey, method, path, body = null) {
   });
 
   const text = await res.text();
-  if (!res.ok) throw new Error(Bayse ${res.status}: ${text});
+  if (!res.ok) throw new Error(`Bayse ${res.status}: ${text}`);
   return JSON.parse(text);
 }
 
 export async function readRequest(pubKey, path) {
-  const res = await fetch(${BASE}${path}, {
+  const res = await fetch(`${BASE}${path}`, {
     headers: { "X-Public-Key": pubKey },
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(Bayse ${res.status}: ${text});
+  if (!res.ok) throw new Error(`Bayse ${res.status}: ${text}`);
   return JSON.parse(text);
 }
 
 export async function getEvents(pubKey, { status = "open", category, size = 50, page = 1, currency = "NGN" } = {}) {
   const q = new URLSearchParams({ status, size, page, currency });
   if (category) q.set("category", category);
-  const data = await readRequest(pubKey, /v1/pm/events?${q});
+  const data = await readRequest(pubKey, `/v1/pm/events?${q}`);
   return data?.events || [];
 }
 
 export async function getEventById(pubKey, eventId) {
-  return readRequest(pubKey, /v1/pm/events/${eventId});
+  return readRequest(pubKey, `/v1/pm/events/${eventId}`);
 }
 
 export async function placeOrder(pubKey, secKey, eventId, marketId, body) {
-  const path = /v1/pm/events/${eventId}/markets/${marketId}/orders;
+  const path = `/v1/pm/events/${eventId}/markets/${marketId}/orders`;
   return signedRequest(pubKey, secKey, "POST", path, body);
 }
 
