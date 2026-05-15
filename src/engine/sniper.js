@@ -8,7 +8,7 @@ import { executeTrade }    from "./executor.js";
 import { getActiveUsers, getOpenEventIds, getUser } from "../db/database.js";
 import { decrypt }         from "../utils/encryption.js";
 import { sendTradeExecuted, sendTradeFailed } from "../bot/alerts.js";
-import { runBTC15mSignal } from "../signals/btc15m.js";
+import { runBTC15mSignal } from "../signals/index.js";
 import { lastTradeTimes }  from "./engineLoop.js";
 
 const SNIPER_TICK_MS   = 10_000;  // 10 seconds
