@@ -215,3 +215,4 @@ export async function runAllSignals(pubKey) {
 
   return { crypto, btc15m, sentiment, pressure, composite, direction, agreement };
 }
+export { btc15mSignal as runBTC15mSignal };
