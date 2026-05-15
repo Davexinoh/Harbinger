@@ -27,7 +27,7 @@ const BTC_TITLE_MATCH = "bitcoin up or down";
 async function fetchBTCMarkets(pubKey) {
   try {
     const res = await fetch(
-      https://relay.bayse.markets/v1/pm/events?category=crypto&status=open&size=30&currency=NGN,
+      `https://relay.bayse.markets/v1/pm/events?category=crypto&status=open&size=30&currency=NGN`,
       { headers: { "X-Public-Key": pubKey } }
     );
     if (!res.ok) return [];
@@ -97,13 +97,13 @@ async function sniperTick() {
     const dir   = btcSignal?.direction;
 
     if (score < MIN_BTC_SCORE || !dir) {
-      console.log([Sniper] BTC signal weak (${score.toFixed(2)}) — holding);
+      console.log(`[Sniper] BTC signal weak (${score.toFixed(2)}) — holding`);
       return;
     }
 
     console.log(
-      [Sniper] 🎯 ${targets.length} fresh BTC market(s) |  +
-      btc15m:${score.toFixed(2)} ${dir} | firing for ${users.length} users
+      `[Sniper] 🎯 ${targets.length} fresh BTC market(s) | ` +
+      `btc15m:${score.toFixed(2)} ${dir} | firing for ${users.length} users`
     );
 
     for (const user of users) {
@@ -124,7 +124,9 @@ async function sniperTick() {
             market,
             direction,
             edge: Math.abs((market.outcome1Price || 0.5) - 0.5),
-          };// Build minimal signals object for executor
+          };
+
+          // Build minimal signals object for executor
           const signals = {
             composite: score,
             direction,
@@ -140,7 +142,7 @@ async function sniperTick() {
           lastTradeTimes.set(user.chat_id, Date.now());
 
           await sendTradeExecuted(fresh.chat_id, {
-            title:        🎯 SNIPE: ${event.title},
+            title:        `🎯 SNIPE: ${event.title}`,
             direction:    result.direction,
             amount:       result.amount,
             outcomeLabel: result.outcomeLabel,
@@ -148,15 +150,15 @@ async function sniperTick() {
           });
 
           console.log(
-            [Sniper] ✓ ${user.chat_id} | ${direction} |  +
-            p:${market.outcome1Price} | ₦${result.amount}
+            `[Sniper] ✓ ${user.chat_id} | ${direction} | ` +
+            `p:${market.outcome1Price} | ₦${result.amount}`
           );
 
         } catch (err) {
-          console.error([Sniper] ${user.chat_id} failed:, err.message);
+          console.error(`[Sniper] ${user.chat_id} failed:`, err.message);
           await sendTradeFailed(user.chat_id, {
             composite: score,
-            error:     Sniper: ${err.message},
+            error:     `Sniper: ${err.message}`,
           }).catch(() => {});
         }
       }
