@@ -1,8 +1,3 @@
-// Harbinger Sniper — BTC 15m markets ONLY
-// Scans every 10 seconds for fresh "Bitcoin Up or Down - 15 minutes?" markets
-// Fires immediately when market opens near 50¢ and BTC signal is directional
-// Target: catch market before crowd moves price away from 50¢
-
 import fetch from "node-fetch";
 import { executeTrade }    from "./executor.js";
 import { getActiveUsers, getOpenEventIds, getUser } from "../db/database.js";
@@ -11,31 +6,28 @@ import { sendTradeExecuted, sendTradeFailed } from "../bot/alerts.js";
 import { runBTC15mSignal } from "../signals/index.js";
 import { lastTradeTimes }  from "./engineLoop.js";
 
-const SNIPER_TICK_MS   = 10_000;  // 10 seconds
+const SNIPER_TICK_MS   = 10_000;
 const MIN_TRADE_GAP_MS = 5 * 60 * 1000;
-const FRESH_MAX_PRICE  = 0.58;    // market still "fresh" — hasn't moved far from 50¢
+const FRESH_MAX_PRICE  = 0.58;
 const FRESH_MIN_PRICE  = 0.42;
-const MIN_BTC_SCORE    = 0.54;    // minimum BTC signal strength to fire
+const MIN_BTC_SCORE    = 0.56;
 
-const sniped  = new Set(); // markets already traded this session
+const sniped  = new Set();
 let   timer   = null;
 let   running = false;
 
-// Only these exact BTC market titles
-const BTC_TITLE_MATCH = "bitcoin up or down";
-
 async function fetchBTCMarkets(pubKey) {
   try {
-    const res = await fetch(
-      `https://relay.bayse.markets/v1/pm/events?category=crypto&status=open&size=30&currency=NGN`,
-      { headers: { "X-Public-Key": pubKey } }
-    );
+    const url = "https://relay.bayse.markets/v1/pm/events?category=crypto&status=open&size=30&currency=NGN";
+    const res = await fetch(url, {
+      headers: { "X-Public-Key": pubKey },
+    });
     if (!res.ok) return [];
     const data = await res.json();
     return (data?.events || []).filter(e => {
       const title = (e.title || "").toLowerCase();
       return (
-        title.includes(BTC_TITLE_MATCH) &&
+        title.includes("bitcoin up or down") &&
         e.engine !== "AMM" &&
         e.markets?.some(m => m.status === "open")
       );
@@ -72,7 +64,6 @@ async function sniperTick() {
     const events = await fetchBTCMarkets(pubKey);
     if (!events.length) return;
 
-    // Find fresh markets not yet sniped
     const targets = [];
     for (const event of events) {
       const market = event.markets.find(m =>
@@ -85,7 +76,6 @@ async function sniperTick() {
 
     if (!targets.length) return;
 
-    // Get BTC 15m signal — the only signal that matters for this market
     let btcSignal;
     try {
       btcSignal = await runBTC15mSignal();
@@ -102,8 +92,7 @@ async function sniperTick() {
     }
 
     console.log(
-      `[Sniper] 🎯 ${targets.length} fresh BTC market(s) | ` +
-      `btc15m:${score.toFixed(2)} ${dir} | firing for ${users.length} users`
+      `[Sniper] ${targets.length} fresh BTC market(s) | btc15m:${score.toFixed(2)} ${dir} | firing`
     );
 
     for (const user of users) {
@@ -126,7 +115,6 @@ async function sniperTick() {
             edge: Math.abs((market.outcome1Price || 0.5) - 0.5),
           };
 
-          // Build minimal signals object for executor
           const signals = {
             composite: score,
             direction,
@@ -142,7 +130,7 @@ async function sniperTick() {
           lastTradeTimes.set(user.chat_id, Date.now());
 
           await sendTradeExecuted(fresh.chat_id, {
-            title:        `🎯 SNIPE: ${event.title}`,
+            title:        "SNIPE: " + event.title,
             direction:    result.direction,
             amount:       result.amount,
             outcomeLabel: result.outcomeLabel,
@@ -150,21 +138,19 @@ async function sniperTick() {
           });
 
           console.log(
-            `[Sniper] ✓ ${user.chat_id} | ${direction} | ` +
-            `p:${market.outcome1Price} | ₦${result.amount}`
+            `[Sniper] ${user.chat_id} | ${direction} | p:${market.outcome1Price} | NGN ${result.amount}`
           );
 
         } catch (err) {
           console.error(`[Sniper] ${user.chat_id} failed:`, err.message);
           await sendTradeFailed(user.chat_id, {
             composite: score,
-            error:     `Sniper: ${err.message}`,
+            error:     "Sniper: " + err.message,
           }).catch(() => {});
         }
       }
     }
 
-    // Prevent memory leak on long-running instances
     if (sniped.size > 500) sniped.clear();
 
   } catch (err) {
