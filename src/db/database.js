@@ -1,12 +1,25 @@
 import pg from "pg";
 const { Pool } = pg;
 
+// Managed Postgres behind a public hostname (Render, Railway's public proxy,
+// Supabase, Neon) requires TLS. Railway's private network and local dev speak
+// plaintext — handing `pg` an ssl object there fails the connection outright
+// with "The server does not support SSL connections".
+function sslConfig() {
+  if (process.env.PGSSL === "disable") return false;
+  if (process.env.PGSSL === "require")  return { rejectUnauthorized: false };
+
+  const url = process.env.DATABASE_URL || "";
+  const plaintextHost = /@(localhost|127\.0\.0\.1|\[::1\]|[^/@]*\.railway\.internal)(:\d+)?\//.test(url);
+  return plaintextHost ? false : { rejectUnauthorized: false };
+}
+
 let pool;
 export function getPool() {
   if (!pool) {
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
+      ssl: sslConfig(),
     });
     pool.on("error", err => console.error("[DB] Pool error:", err.message));
   }

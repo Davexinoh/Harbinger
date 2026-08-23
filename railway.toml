@@ -1,0 +1,20 @@
+# Railway deploy config — Harbinger
+#
+# numReplicas MUST stay at 1. Telegram permits exactly one getUpdates consumer
+# per bot token, so a second replica produces a permanent 409 conflict storm
+# where neither instance can hold the poll.
+#
+# Also confirm App Sleeping is DISABLED on this service. It is the Railway
+# equivalent of the Render idle spin-down that took the bot offline, and a
+# sleeping bot stops polling Telegram entirely.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand             = "npm start"
+healthcheckPath          = "/health"
+healthcheckTimeout       = 120
+restartPolicyType        = "ALWAYS"
+restartPolicyMaxRetries  = 10
+numReplicas              = 1

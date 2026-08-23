@@ -2,77 +2,91 @@
 
 > *The market moves. We saw it coming.*
 
-Harbinger is an autonomous signal-to-trade engine for [Bayse](https://bayse.markets) prediction markets. It watches the world — crypto momentum, football form, live news — and trades when signals converge. No manual input. No guesswork. The engine decides.
-
-Built on top of Bayse's public API, Harbinger is the first prediction market bot where the community is a live signal source, not just an audience. When signals heat up, the crowd votes. Those votes feed directly into the engine's decision.
+Harbinger is an autonomous signal-to-trade engine for [Bayse](https://bayse.markets) prediction markets. It watches crypto momentum, order flow, and live news, and trades when signals converge. No manual input. No guesswork. The engine decides.
 
 ---
 
 ## How It Works
 
-Every 60 seconds, three signal workers run in parallel:
+Every 60 seconds, four signal workers run in parallel.
 
-**Crypto momentum** watches BTC, ETH, and SOL on CoinGecko. It measures price velocity over 1 hour and 24 hours, weighs volume-to-market-cap ratios, and produces a directional confidence score. A 5% move in an hour is extreme. The engine knows that.
+**Crypto momentum** (35%) reads BTC, ETH, and SOL from Binance. For each symbol it compares the last hour against the previous 24 hours and casts a bull or bear vote. Three symbols agreeing is a strong read; a split is noise.
 
-**Football form** pulls upcoming fixtures from African leagues and global competitions via API-Football. It scores each match by comparing the recent win/draw/loss record of both teams. The bigger the form gap, the stronger the signal. If one team has won 5 straight and the market still shows it as a coin flip — that's an inefficiency. Harbinger sees it.
+**BTC 15m** (30%) pulls thirty 15-minute candles for BTCUSDT and computes a 14-period RSI alongside 5-candle price momentum and volume against its 10-candle mean. Oversold and turning up is the high-conviction case. So is overbought and turning down. Thin volume pulls the score back toward neutral.
 
-**News sentiment** reads live RSS feeds from BBC Sport Africa, CoinDesk, CoinTelegraph, and Premium Times NG. It filters for market-relevant headlines and scores them against a vocabulary of bullish and bearish signals. Only fresh headlines — within the last two hours — count.
+**Market pressure** (20%) reads Bayse's own order book — the average YES price across up to ten open CLOB crypto markets. When the book leans, that lean is information.
 
-These three signals are weighted and combined into a single composite score. When that score crosses a user-defined confidence threshold, the engine finds the best matching open market on Bayse, gets a live quote, and places the trade.
+**News sentiment** (15%) scores live headlines from CoinDesk, Cointelegraph, Nairametrics, and BBC Sport Africa against a bullish/bearish vocabulary, weighted by source. Feeds get four seconds to answer or they're skipped.
 
----
-
-## The 4th Signal — Community Wisdom
-
-This is what makes Harbinger different from every other bot.
-
-When the composite score enters the warmup zone — strong enough to be interesting, not yet strong enough to trade — Harbinger posts a poll to every Telegram group it's in. The question is generated from the live signal context: the event title, the engine's directional read, and the current confidence level.
-
-The crowd votes. YES, NO, or Too Early to Call.
-
-Those votes become a fourth signal, weighted at 18% of the composite. Strong crowd agreement boosts the trade. Strong crowd disagreement can stop it entirely. And over time, the engine tracks how accurate the crowd has been — building a calibration record that gets richer with every resolved market.
-
-The crowd isn't commentary. The crowd is signal.
+The four scores combine into one weighted composite between 0 and 1. Direction is decided by majority vote across the four workers. Any worker that fails degrades to a neutral 0.5 rather than stalling the tick.
 
 ---
 
 ## Signals → Decision → Trade
 
-The decision gate combines all four signals and checks for consensus. At least 3 out of 4 must agree on direction before the engine acts. If the crowd has voted strongly against the algorithmic signals, the engine stands down regardless of the composite score.
+When the composite crosses the user's confidence threshold, the engine looks for a market worth taking.
 
-Position sizing scales with conviction. At threshold, the engine bets the minimum. As confidence climbs toward 95%, it scales toward the user's maximum. A strong crowd agreement — 10 or more votes, 70%+ consensus — adds a small boost on top.
+It considers CLOB markets only — AMM events are excluded outright — priced between 10¢ and 90¢, skipping any event where the user already holds an open position. Each candidate is scored on **edge**: how far the market's price sits from 50¢ in the direction the signal points. A signal reading UP against a market pricing YES at 30¢ is edge. The same signal against YES at 85¢ is not, and the engine passes. Nothing is entered below 5¢ of edge, regardless of how strong the composite is. Bitcoin short-horizon markets get a ranking bonus.
 
-Every trade fires against an AMM market on Bayse. Before any order is placed, the engine requests a live quote and sanity-checks the expected price. If the market is already priced at an extreme, the trade is skipped. Never trade blind.
+Position size scales with conviction, from half the user's maximum at threshold toward the full amount as the composite approaches 1, with a ₦100 floor. Orders are placed as NGN market orders. A five-minute cooldown separates trades per user.
+
+**The sniper** runs a tighter loop alongside the main engine, scanning every 10 seconds for freshly opened *Bitcoin Up or Down* markets still priced between 42¢ and 58¢. When the BTC 15m signal alone clears 0.56, it fires on those directly — the edge in a 15-minute market decays too fast to wait for the next 60-second tick.
 
 ---
 
 ## What Users See
 
-Harbinger is entirely Telegram-native. There's no website to log into, no dashboard to check. Everything happens in the chat.
+Harbinger is entirely Telegram-native. No website, no dashboard.
 
-Users connect their Bayse API keys through a guided flow. Keys are encrypted with AES-256 before storage and never logged. Once connected, users set their confidence threshold and maximum trade size, type `/run`, and the engine takes over.
-
-From that point, Harbinger messages the user every time it fires a trade — what it traded, why, which signal led, the entry price, and the full signal breakdown. It also messages when signals are warming up, so users feel the engine thinking before it acts.
-
-Groups get broadcast updates whenever the composite score is elevated. They get crowd polls when signals are hot. Over time, a group running Harbinger becomes a live prediction market intelligence feed.
+Users connect their Bayse API keys through a guided flow. Keys are encrypted with AES-256-CBC before storage and never logged. Once connected, users set a confidence threshold and maximum trade size, type `/run`, and the engine takes over — messaging on every trade with the market, the side, the size, and the signal breakdown behind it.
 
 ---
 
 ## Commands
 
-`/start` `/connect` `/setup` `/run` `/pause` `/resume` `/stop` `/status` `/signals` `/trades` `/pnl` `/markets` `/hot` `/limit` `/threshold` `/crowdiq` `/disconnect`
+`/start` `/connect` `/disconnect` `/setup` `/run` `/pause` `/resume` `/stop` `/status` `/signals` `/category` `/markets` `/trades` `/pnl` `/cancel`
 
 ---
 
 ## Stack
 
-Node.js · Express · SQLite · Telegram Bot API · Bayse Markets API · CoinGecko · API-Football · RSS
+Node.js 22 · Express · PostgreSQL · Telegram Bot API · Bayse Markets API · Binance public API · RSS
 
-Deployed on Render. No external database. No paid AI APIs. Everything runs on free-tier infrastructure.
+Deployed on Railway as a single always-on worker. No paid AI APIs.
+
+### Running locally
+
+```bash
+npm install
+cp .env.example .env    # fill in TELEGRAM_BOT_TOKEN, DATABASE_URL, ENCRYPTION_KEY
+npm start
+```
+
+Verify all four signal sources resolve before enabling live trading:
+
+```bash
+npm run smoke -- <bayse_public_key>
+```
+
+---
+
+## Current Limitations
+
+Worth stating plainly, since this engine moves real money:
+
+- **Risk limits in `.env.example` are not wired up.** Per-trade sizing lives as constants in `src/engine/executor.js`. There is no daily-loss or balance-percentage enforcement in code yet.
+- **Cooldown and dedupe state is in-memory.** A restart clears the five-minute trade gap and the sniper's already-hit set, so a crash loop can trade more often than intended.
+- **Exactly one instance may run per bot token.** Telegram allows a single `getUpdates` consumer, so a second replica produces a permanent 409 conflict.
+
+## Roadmap
+
+- **Community signal.** Crowd polls posted to Telegram groups during the warmup zone, feeding group consensus back into the composite as a fifth input, with a calibration record tracked over time. Designed, not yet built.
+- Persist cooldown and position state to Postgres.
+- Wire the risk limits in `.env.example` into the engine.
 
 ---
 
 ## Built By
 
-[@dontfadedave](https://twitter.com/dontfadedave) — Davexinoh Labs  
+[@dontfadedave](https://twitter.com/dontfadedave) — Davexinoh Labs
 Powered by [Bayse Markets](https://bayse.markets)

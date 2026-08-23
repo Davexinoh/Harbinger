@@ -1,0 +1,16 @@
+node_modules/
+
+# Secrets. This repository is public — never commit a populated .env.
+.env
+.env.*
+!.env.example
+
+npm-debug.log*
+yarn-error.log*
+*.log
+
+.DS_Store
+Thumbs.db
+
+.idea/
+.vscode/
