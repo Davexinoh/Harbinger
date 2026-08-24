@@ -1,11 +1,23 @@
 import crypto from "crypto";
 
-const rawKey = process.env.ENCRYPTION_KEY || "";
+// Trim before validating. A trailing newline or space picked up while pasting
+// the value into a dashboard is the usual reason this check fails, and
+// whitespace is never valid hex — so trimming can only rescue a bad value, it
+// can never alter the bytes of a good one.
+const rawKey = (process.env.ENCRYPTION_KEY || "").trim();
 
 if (!/^[0-9a-fA-F]{64}$/.test(rawKey)) {
+  // Describe the shape of what we got, never the value itself.
+  const detail =
+    rawKey.length === 0
+      ? "it is empty or unset"
+      : `got ${rawKey.length} character(s)` +
+        (/^[0-9a-fA-F]*$/.test(rawKey) ? "" : ", including non-hex characters");
+
   throw new Error(
-    "ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes). " +
-    "Generate one with: node -e \"require('crypto').randomBytes(32).toString('hex')\""
+    `ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes) — ${detail}. ` +
+    "Generate one with: " +
+    "node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
   );
 }
 
