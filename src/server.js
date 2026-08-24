@@ -25,8 +25,21 @@ registerCommands(bot);
 
 // Telegram allows exactly one getUpdates consumer per token. Clearing any
 // webhook first stops a stale webhook from swallowing updates.
-await bot.setWebHook("");
-await bot.startPolling();
+//
+// A rejected token here would otherwise surface as a top-level rejection that
+// dumps the whole HTTP response object, and with instant restarts that floods
+// the platform's log rate limit. Fail in one readable line instead.
+try {
+  await bot.setWebHook("");
+  await bot.startPolling();
+} catch (err) {
+  const status = err?.response?.statusCode;
+  console.error(
+    `[Bot] Telegram rejected TELEGRAM_BOT_TOKEN (HTTP ${status ?? "unknown"}). ` +
+    "401 means the token is revoked, malformed, or has stray characters."
+  );
+  process.exit(1);
+}
 
 let restartingPolling = false;
 
